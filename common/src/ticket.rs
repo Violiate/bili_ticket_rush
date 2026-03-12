@@ -212,7 +212,8 @@ pub struct TicketInfo {
     pub end_time: i64,
     pub pick_seat: usize, //0:不选座 1:选座
     pub project_type: usize, //未知作用，bw2024是type1
-    pub express_fee: usize, //快递费
+    #[serde(default)]
+    pub express_fee: Option<usize>, //快递费
     pub sale_begin: i64, //开售时间
     pub sale_end: i64, //截止时间
     pub count_down: i64, //倒计时（可能有负数）
