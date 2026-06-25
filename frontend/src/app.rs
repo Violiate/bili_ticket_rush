@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -182,8 +181,6 @@ pub struct Myapp{
 
 pub struct AccountManager{
     pub accounts: Vec<Account>,
-    
-    pub active_tasks: HashMap<String, TicketTask>,
 }
 
 //获取全部订单结构体（便于区分）
@@ -273,7 +270,6 @@ impl Myapp{
              task_manager: Box::new(TaskManagerImpl::new()),
              account_manager: AccountManager {
                  accounts: Config::load_all_accounts(),
-                 active_tasks: HashMap::new(),
              },
              
             push_config : match serde_json::from_value::<PushConfig>(config["push_config"].clone()) {

@@ -330,23 +330,42 @@ pub struct SubmitSmsLoginResult {
     pub message: String,
     pub cookie: Option<String>,
 }
+/// 运行中抢票任务的快照，供 UI 渲染（无 `Instant`，可直接跨线程 clone）
+#[derive(Clone, Debug)]
+pub struct RunningTaskInfo {
+    pub task_id: String,
+    /// 友好序号，#1 #2 …
+    pub seq: u64,
+    pub uid: i64,
+    pub account_name: String,
+    pub project_name: String,
+    /// 0 定时 1 直接 2 捡漏
+    pub grab_mode: u8,
+    pub status: TaskStatus,
+    /// 查询时即时算出的已运行秒数
+    pub elapsed_secs: u64,
+}
+
 // 更新 TaskManager trait
 pub trait TaskManager: Send + 'static {
     // 创建新的任务管理器
     fn new() -> Self where Self: Sized;
-    
+
     // 提交任务
     fn submit_task(&mut self, request: TaskRequest) -> Result<String, String>;
-    
+
     // 获取可用结果，返回 TaskResult 枚举
     fn get_results(&mut self) -> Vec<TaskResult>;
-    
+
     // 取消任务
     fn cancel_task(&mut self, task_id: &str) -> Result<(), String>;
 
     // 获取任务状态
     fn get_task_status(&self, task_id: &str) -> Option<TaskStatus>;
-     
+
+    // 列出所有正在运行的抢票任务快照
+    fn list_running_tasks(&self) -> Vec<RunningTaskInfo>;
+
      // 关闭任务管理器
     fn shutdown(&mut self);
 }

@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+use common::record_log::TASK_LABEL;
 
 use common::cookie_manager::CookieManager;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -24,10 +26,33 @@ use crate::show_orderlist::get_orderlist;
 use crate::api::{*};
 
 
+struct GrabTaskEntry {
+    info_seed: RunningTaskInfo,
+    start_time: std::time::Instant,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+/// RAII 守卫：任务结束时（正常返回 / return / panic unwind）都会从注册表移除该任务，
+/// 避免 panic 路径下留下永久「运行中」的僵尸条目。用 `if let Ok` 规避锁中毒再次 panic。
+struct GrabRegistryGuard {
+    registry: Arc<Mutex<HashMap<String, GrabTaskEntry>>>,
+    task_id: String,
+}
+
+impl Drop for GrabRegistryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.remove(&self.task_id);
+        }
+    }
+}
+
 pub struct TaskManagerImpl {
     task_sender: mpsc::Sender<TaskMessage>,
     result_receiver: mpsc::Receiver<TaskResult>,
     running_tasks: HashMap<String, Task>, // 使用 Task 枚举
+    grab_registry: Arc<Mutex<HashMap<String, GrabTaskEntry>>>,
+    seq_counter: Arc<AtomicU64>,
     runtime: Arc<Runtime>,
     _worker_thread: Option<thread::JoinHandle<()>>,
 }
@@ -47,7 +72,13 @@ impl TaskManager for TaskManagerImpl {
         // 创建tokio运行时
         let runtime = Arc::new(Runtime::new().unwrap());
         let rt = runtime.clone();
-        
+
+        let grab_registry: Arc<Mutex<HashMap<String, GrabTaskEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let seq_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let grab_registry_worker = grab_registry.clone();
+        let seq_counter_worker = seq_counter.clone();
+
         // 启动工作线程
         let worker = thread::spawn(move || {
             rt.block_on(async {
@@ -412,7 +443,42 @@ impl TaskManager for TaskManagerImpl {
                                             cookie_manager.get_ua().clone(),
                                         )))
                                     };
+                                    // 注册到抢票任务注册表
+                                    let cancel_flag = Arc::new(AtomicBool::new(false));
+                                    let seq = seq_counter_worker.fetch_add(1, Ordering::Relaxed) + 1;
+                                    let project_name_for_entry = project_info.as_ref()
+                                        .and_then(|p| p.name.clone())
+                                        .unwrap_or_else(|| project_id.clone());
+                                    let account_name_for_entry = grab_ticket_req.biliticket.account.name.clone();
+                                    let task_label = format!("#{} {}", seq, account_name_for_entry);
+                                    {
+                                        let entry = GrabTaskEntry {
+                                            info_seed: RunningTaskInfo {
+                                                task_id: task_id.clone(),
+                                                seq,
+                                                uid,
+                                                account_name: account_name_for_entry,
+                                                project_name: project_name_for_entry,
+                                                grab_mode: mode,
+                                                status: TaskStatus::Running,
+                                                elapsed_secs: 0,
+                                            },
+                                            start_time: std::time::Instant::now(),
+                                            cancel_flag: cancel_flag.clone(),
+                                        };
+                                        if let Ok(mut reg) = grab_registry_worker.lock() {
+                                            reg.insert(task_id.clone(), entry);
+                                        }
+                                    }
+                                    let grab_registry_cleanup = grab_registry_worker.clone();
+                                    let task_id_cleanup = task_id.clone();
                                     tokio::spawn(async move{
+                                    // 守卫在 spawn 内最外层创建，任务以任何方式结束（含 panic）时都会清理注册表
+                                    let _registry_guard = GrabRegistryGuard {
+                                        registry: grab_registry_cleanup,
+                                        task_id: task_id_cleanup,
+                                    };
+                                    TASK_LABEL.scope(task_label, async move {
                                         log::debug!("开始分析抢票任务：{}",task_id);
                                        
                                         match mode {
@@ -431,15 +497,21 @@ impl TaskManager for TaskManagerImpl {
                                                 if countdown > 0.0{
                                                     log::info!("距离抢票时间还有{}秒",countdown);
                                                     loop{
+                                                        if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                         if countdown <= 20.0 {
                                                             break;
                                                         }
                                                         countdown = countdown - 15.0;
-                                                        tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                                                        // 分片 sleep，使取消在约 1 秒内生效
+                                                        for _ in 0..15 {
+                                                            if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
+                                                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                                        }
                                                         log::info!("距离抢票时间还有{}秒",countdown);
-                                                        
+
                                                     }
                                                     loop{
+                                                        if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                         if countdown <= 1.3 {  //按道理来说countdown是1秒，为了保险多设置几秒
                                                             tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.8)).await;
                                                             break;
@@ -459,7 +531,7 @@ impl TaskManager for TaskManagerImpl {
 
                                                 //抢票主循环
                                                 loop{
-
+                                                    if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                     let token_result = get_ticket_token(cookie_manager.clone(), cpdd.clone(),&project_id, &screen_id, &ticket_id, count, is_hot).await;
                                                     match token_result {
                                                         Ok((token,ptoken)) => {
@@ -586,16 +658,16 @@ impl TaskManager for TaskManagerImpl {
                                             1 => {
                                                 log::debug!("直接抢票模式");
                                                 let mut token_retry_count = 0;
-                                                const MAX_TOKEN_RETRY: i8 = 10; 
+                                                const MAX_TOKEN_RETRY: i8 = 10;
                                                 let mut confirm_order_retry_count = 0;
                                                 const MAX_CONFIRM_ORDER_RETRY: i8 = 4;
                                                 let mut order_retry_count = 0;
                                                 let mut need_retry = false;
-                                                
-                                                
+
+
                                                 //抢票主循环
                                                 loop{
-
+                                                    if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                     let token_result = get_ticket_token(cookie_manager.clone(), cpdd.clone(),&project_id, &screen_id, &ticket_id, count, is_hot).await;
                                                     match token_result {
                                                         Ok((token,ptoken)) => {
@@ -725,6 +797,7 @@ impl TaskManager for TaskManagerImpl {
                                                 const MAX_TOKEN_RETRY: i8 = 5;
                                                 // 外层循环，一旦抢票成功或遇到致命错误就退出
                                                 'main_loop: loop {
+                                                    if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                     log::debug!("project_id: {}, screen_id: {}, ticket_id: {}", project_id, screen_id, ticket_id);
                                                     
                                                     // 获取项目数据
@@ -750,6 +823,7 @@ impl TaskManager for TaskManagerImpl {
                                                     } 
                                                     local_grab_request.biliticket.id_bind = project_data.data.id_bind.unwrap_or(0);
                                                     'screen_loop: for screen_data in project_data.data.screen_list {
+                                                        if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                         if !screen_data.clickable {
                                                             continue; 
                                                         }
@@ -760,6 +834,7 @@ impl TaskManager for TaskManagerImpl {
                                                         
                                                         // 遍历票种
                                                         'ticket_loop: for ticket_data in screen_data.ticket_list {
+                                                            if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                             if !ticket_data.clickable.unwrap_or(false) {
                                                                 continue; // 跳过不可点击的票种
                                                             }
@@ -923,6 +998,8 @@ impl TaskManager for TaskManagerImpl {
                                                 log::error!("未知模式");
                                             }
                                         }
+                                    }).await; // TASK_LABEL.scope end
+                                    // 任务结束后由 _registry_guard 的 Drop 自动从注册表移除
                                     });
                                 }
                             }
@@ -940,17 +1017,19 @@ impl TaskManager for TaskManagerImpl {
             task_sender: task_tx,
             result_receiver: result_rx,
             running_tasks: HashMap::new(),
+            grab_registry,
+            seq_counter,
             runtime: runtime,
             _worker_thread: Some(worker),
         }
     }
     
-    fn submit_task(&mut self, request: TaskRequest) -> Result<String, String> {
+    fn submit_task(&mut self, mut request: TaskRequest) -> Result<String, String> {
         // 生成任务ID
         let task_id = uuid::Uuid::new_v4().to_string();
         
         // 根据请求类型创建相应的任务
-        match &request {
+        match &mut request {
             
             TaskRequest::QrCodeLoginRequest(qrcode_req) => {
                 log::info!("提交二维码登录任务 ID: {}", task_id);
@@ -1056,25 +1135,10 @@ impl TaskManager for TaskManagerImpl {
                 // 保存任务
                 self.running_tasks.insert(task_id.clone(), Task::GetBuyerInfoTask(task));
             }
-            TaskRequest::GrabTicketRequest(grab_ticket_req) => {
+            TaskRequest::GrabTicketRequest(ref mut grab_ticket_req) => {
                 log::info!("提交抢票任务 ID: {}", task_id);
-                
-               /*  // 创建抢票任务
-                let task = GrabTicketTask {
-                    task_id: task_id.clone(),
-                    project_id: grab_ticket_req.project_id.clone(),
-                    screen_id: grab_ticket_req.screen_id.clone(),
-                    ticket_id: grab_ticket_req.ticket_id.clone(),
-                    buyer_info: grab_ticket_req.buyer_info.clone(),
-                    client: grab_ticket_req.client.clone(),
-                    status: TaskStatus::Pending,
-                    start_time: Some(std::time::Instant::now()),
-                    uid: grab_ticket_req.uid.clone(),
-                    grab_mode: grab_ticket_req.grab_mode.clone(),
-                };
-                
-                // 保存任务
-                self.running_tasks.insert(task_id.clone(), Task::GrabTicketTask(task)); */
+                // 将生成的 task_id 注入请求，worker 线程将使用它作为注册表主键
+                grab_ticket_req.task_id = task_id.clone();
             }
 
         }
@@ -1099,33 +1163,46 @@ impl TaskManager for TaskManagerImpl {
     }
     
     fn cancel_task(&mut self, task_id: &str) -> Result<(), String> {
-        if !self.running_tasks.contains_key(task_id) {
-            return Err("任务不存在".to_string());
-        }
-        
-        if let Err(e) = self.task_sender.blocking_send(TaskMessage::CancelTask(task_id.to_owned())) {
-            return Err(format!("无法取消任务: {}", e));
-        }
-        
-        Ok(())
-    }
-    
-    fn get_task_status(&self, task_id: &str) -> Option<TaskStatus> {
-        if let Some(task) = self.running_tasks.get(task_id) {
-            match task {
-                
-                Task::QrCodeLoginTask(t) => Some(t.status.clone()),
-                Task::LoginSmsRequestTask(t) => Some(t.status.clone()),
-                Task::PushTask(t) => Some(t.status.clone()),
-                Task::SubmitLoginSmsRequestTask(t) => Some(t.status.clone()),
-                Task::GetAllorderRequestTask(t) => Some(t.status.clone()),
-                Task::GetTicketInfoTask(t) => Some(t.status.clone()),
-                Task::GetBuyerInfoTask(t) => Some(t.status.clone()),
-                Task::GrabTicketTask(t) => Some(t.status.clone()),
+        let registry = self
+            .grab_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match registry.get(task_id) {
+            Some(entry) => {
+                entry.cancel_flag.store(true, Ordering::Relaxed);
+                Ok(())
             }
-        } else {
-            None
+            None => Err("任务不存在".to_string()),
         }
+    }
+
+    /// 注意：当前仅反映抢票任务（grab_registry）。其它任务类型（登录/订单等）始终返回 None。
+    fn get_task_status(&self, task_id: &str) -> Option<TaskStatus> {
+        let registry = self
+            .grab_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.get(task_id).map(|_| TaskStatus::Running)
+    }
+
+    fn list_running_tasks(&self) -> Vec<RunningTaskInfo> {
+        let registry = self
+            .grab_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut tasks: Vec<RunningTaskInfo> = registry
+            .values()
+            .map(|entry| {
+                let mut info = entry.info_seed.clone();
+                info.elapsed_secs = entry.start_time.elapsed().as_secs();
+                if entry.cancel_flag.load(Ordering::Relaxed) {
+                    info.status = TaskStatus::Failed("取消中".to_string());
+                }
+                info
+            })
+            .collect();
+        tasks.sort_by_key(|t| t.seq);
+        tasks
     }
     
     fn shutdown(&mut self) {
