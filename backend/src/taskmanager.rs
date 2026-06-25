@@ -542,15 +542,16 @@ impl TaskManager for TaskManagerImpl {
         
                                                             //尝试下单
                                                             loop {
+                                                               if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                let (success, retry_limit) = handle_grab_ticket(
-                                                                cookie_manager.clone(), 
+                                                                cookie_manager.clone(),
                                                                 cpdd.clone(),
-                                                                  &project_id, 
-                                                                  &token, 
+                                                                  &project_id,
+                                                                  &token,
                                                                   &ptoken,
                                                                   is_hot.clone(),
-                                                                  &task_id, 
-                                                                  uid, 
+                                                                  &task_id,
+                                                                  uid,
                                                                   &result_tx,
                                                                   &grab_ticket_req,
                                                                   &buyer_info
@@ -585,6 +586,7 @@ impl TaskManager for TaskManagerImpl {
                                                             //获取token失败！分析原因
                                                             if risk_param.code == -401 || risk_param.code == 401 {
                                                                 //需要处理验证码
+                                                                if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                 log::warn!("需要验证码，开始处理验证码...");
                                                                 match handle_risk_verification(
                                                                     cookie_manager.clone(), 
@@ -678,15 +680,16 @@ impl TaskManager for TaskManagerImpl {
         
                                                             //尝试下单
                                                             loop {
+                                                                if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                 let (success, retry_limit) = handle_grab_ticket(
-                                                                 cookie_manager.clone(), 
+                                                                 cookie_manager.clone(),
                                                                  cpdd.clone(),
-                                                                   &project_id, 
-                                                                   &token, 
+                                                                   &project_id,
+                                                                   &token,
                                                                    &ptoken,
                                                                    is_hot.clone(),
-                                                                   &task_id, 
-                                                                   uid, 
+                                                                   &task_id,
+                                                                   uid,
                                                                    &result_tx,
                                                                    &grab_ticket_req,
                                                                    &buyer_info
@@ -722,6 +725,7 @@ impl TaskManager for TaskManagerImpl {
                                                             //获取token失败！分析原因
                                                             if risk_param.code == -401 || risk_param.code == 401 {
                                                                 //需要处理验证码
+                                                                if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                 log::warn!("需要验证码，开始处理验证码...");
                                                                 match handle_risk_verification(
                                                                     cookie_manager.clone(), 
@@ -882,15 +886,16 @@ impl TaskManager for TaskManagerImpl {
                                                                     const MAX_CONFIRM_RETRY: i8 = 4;
                                                             
                                                                     loop {
+                                                                        if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                         let (success, retry_limit) = handle_grab_ticket(
-                                                                         cookie_manager.clone(), 
+                                                                         cookie_manager.clone(),
                                                                          cpdd.clone(),
-                                                                           &project_id, 
-                                                                           &token, 
+                                                                           &project_id,
+                                                                           &token,
                                                                            &ptoken,
                                                                            is_hot.clone(),
-                                                                           &task_id, 
-                                                                           uid, 
+                                                                           &task_id,
+                                                                           uid,
                                                                            &result_tx,
                                                                            &local_grab_request,
                                                                            &buyer_info
@@ -918,6 +923,7 @@ impl TaskManager for TaskManagerImpl {
                                                             //获取token失败！分析原因
                                                             if risk_param.code == -401 || risk_param.code == 401 {
                                                                 //需要处理验证码
+                                                                if cancel_flag.load(Ordering::Relaxed) { log::info!("任务已取消"); return; }
                                                                 log::warn!("需要验证码，开始处理验证码...");
                                                                 match handle_risk_verification(
                                                                     cookie_manager.clone(), 
