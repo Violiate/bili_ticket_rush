@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -182,8 +181,6 @@ pub struct Myapp{
 
 pub struct AccountManager{
     pub accounts: Vec<Account>,
-    
-    pub active_tasks: HashMap<String, TicketTask>,
 }
 
 //获取全部订单结构体（便于区分）
@@ -273,7 +270,6 @@ impl Myapp{
              task_manager: Box::new(TaskManagerImpl::new()),
              account_manager: AccountManager {
                  accounts: Config::load_all_accounts(),
-                 active_tasks: HashMap::new(),
              },
              
             push_config : match serde_json::from_value::<PushConfig>(config["push_config"].clone()) {
@@ -392,19 +388,20 @@ impl Myapp{
         if self.logs.len() > 5000 {
             self.logs.drain(0..2500); // 删除前一半日志
         }
-        // 首先检查是否为错误消息 - 给错误消息更高优先级
-        if message.contains("ERROR:") || message.contains("error:") || message.contains("Error:") {
+        // 横幅触发判定。
+        
+        let is_error = message.contains("] ERROR");
+        
+        let is_success = message.contains("成功") ;
+
+        
+        if is_error {
             self.error_banner_active = true;
             self.error_banner_text = message.to_string();
             self.error_banner_start_time = Some(std::time::Instant::now());
             self.error_banner_opacity = 1.0;
         }
-        // 然后检查是否为成功消息，但使用更严格的条件
-        else if message.contains("info:") || 
-                message.contains("INFO:") || 
-                message.contains("Info:") || 
-                (message.contains("INFO:") && !message.contains("ERROR:")) ||  // 只有包含INFO但不包含ERROR的才算成功
-                message.contains("下单成功") {  
+        else if is_success {
             self.success_banner_active = true;
             self.success_banner_text = message.to_string();
             self.success_banner_start_time = Some(std::time::Instant::now());
@@ -793,6 +790,13 @@ impl Myapp{
 
 impl eframe::App for Myapp{
     fn update(&mut self, ctx:&egui::Context, frame: &mut eframe::Frame){
+        // egui 默认是“响应式”重绘：仅在有输入事件（鼠标/键盘）或显式 request_repaint 时才刷新。
+        // 抢票任务运行在后台独立线程（TaskManagerImpl 的 worker 线程 + tokio），不受 UI 影响，
+        // 即使界面静止也在正常抢票；但若不主动请求重绘，鼠标静止时界面（已运行计时、实时日志、
+        // 任务列表、后台结果处理）会看起来“卡住”。这里请求一个稳定的基线重绘保证界面持续刷新。
+        // 日志列表已虚拟化、任务卡片数量很少，此处低频重绘开销可忽略，不会重新引入卡顿。
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
         //侧栏
         ui::sidebar::render_sidebar(self,ctx);
 

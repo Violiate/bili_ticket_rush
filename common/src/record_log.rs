@@ -5,6 +5,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+// 每个抢票 async 任务携带的短标签，如 "#1 昵称"；非任务上下文中 try_with 返回 Err 自然无前缀
+tokio::task_local! {
+    pub static TASK_LABEL: String;
+}
+
 
 // 日志文件处理相关内容
 lazy_static::lazy_static! {
@@ -115,8 +120,11 @@ impl log::Log for CollectorLogger{
     fn log(&self,record: &Record){
         if self.enabled(record.metadata()){
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S:%3f");
-            let log_message = format!("[{}] {}: {}", 
-                timestamp, record.level(), record.args());
+            let label = TASK_LABEL.try_with(|l| l.clone()).ok();
+            let log_message = match label {
+                Some(l) => format!("[{}] {} [{}]: {}", timestamp, record.level(), l, record.args()),
+                None    => format!("[{}] {}: {}",      timestamp, record.level(),    record.args()),
+            };
 
                 {
                     if let Ok(mut collector) = LOG_COLLECTOR.try_lock() { // 使用 try_lock 避免长时间等待
