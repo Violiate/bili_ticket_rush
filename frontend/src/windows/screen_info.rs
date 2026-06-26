@@ -150,8 +150,8 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
                                             egui::Button::new(button_text)
                                         ).clicked() {
                                             // 使用正确的类型赋值
-                                            if !ticket.clickable.unwrap_or(false){
-                                                log::error!("请注意！该票种目前不可售！但是会尝试下单，如果该票持续不可售，多次下单不可售票种可能会被b站拉黑")
+                                            if !ticket.clickable.unwrap_or(false) && app.grab_mode == 1 {
+                                                log::error!("请注意！该票种目前不可售！您选择的直接抢票模式会尝试下单，如果该票持续不可售，多次下单不可售票种可能会被b站拉黑")
                                             }
                                             app.selected_screen_id = Some(selected_screen.id.unwrap_or(0) as i64);
                                             app.selected_ticket_id = Some(ticket.id.unwrap_or(0) as i64);
