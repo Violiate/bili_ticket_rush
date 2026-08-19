@@ -163,10 +163,10 @@ A: 请确认是否开启了日志记录功能。可在设置中调整日志级�
 <!-- 可以添加许可证信息 -->
 ## Star History
 
-<a href="https://star-history.com/#biliticket/bili_ticket_rush&Date">
+<a href="https://star-history.dera.page/#biliticket/bili_ticket_rush&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=biliticket/bili_ticket_rush&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=biliticket/bili_ticket_rush&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=biliticket/bili_ticket_rush&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=biliticket/bili_ticket_rush&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=biliticket/bili_ticket_rush&type=Date" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=biliticket/bili_ticket_rush&type=Date" />
  </picture>
 </a>
