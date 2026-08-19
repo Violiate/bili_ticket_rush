@@ -1,9 +1,13 @@
 use serde::{Serialize, Deserialize};
 use reqwest::Client;
-use crate::{cookie_manager, http_utils::{request_get_sync,request_post_sync}};
+use crate::cookie_manager;
 use serde_json;
 use std::sync::Arc;
+use std::time::Duration;
 use crate::cookie_manager::CookieManager;
+
+const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
+const NAV_MAX_ATTEMPTS: usize = 3;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Account{
     pub uid: i64,  //UID
@@ -42,18 +46,10 @@ impl std::fmt::Debug for Account{
 
 pub fn add_account(cookie: &str ,client: &Client, ua: &str) -> Result<Account, String>{
     log::info!("添加账号: {}", cookie);
-    let response = request_get_sync(
-        client,
-        "https://api.bilibili.com/x/web-interface/nav",
-        Some(ua.to_string()),
-        Some(cookie),
-    ).map_err(|e| e.to_string())?;
     
-    // 创建一个临时的运行时来执行异步代码
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let json = rt.block_on(async {
-        response.json::<serde_json::Value>().await
-    }).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("创建账号登录运行时失败: {}", e))?;
+    let json = rt.block_on(fetch_nav_json(client, cookie, ua))?;
     let cookie_manager = Arc::new(rt.block_on(async{
         cookie_manager::CookieManager::new(cookie, Some(ua), 0).await
     }));
@@ -82,6 +78,77 @@ pub fn add_account(cookie: &str ,client: &Client, ua: &str) -> Result<Account, S
     } else {
         Err("无法获取用户信息".to_string())
     }
+}
+
+async fn fetch_nav_json(client: &Client, cookie: &str, ua: &str) -> Result<serde_json::Value, String> {
+    let mut last_error = String::new();
+
+    for attempt in 1..=NAV_MAX_ATTEMPTS {
+        let response = match client
+            .get(NAV_URL)
+            .header(reqwest::header::COOKIE, cookie)
+            .header(reqwest::header::USER_AGENT, ua)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("请求账号信息失败: {}", error);
+                if attempt < NAV_MAX_ATTEMPTS {
+                    log::warn!("{}，正在重试 ({}/{})", last_error, attempt, NAV_MAX_ATTEMPTS);
+                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let status = response.status();
+        let content_length = response.content_length();
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                last_error = format!(
+                    "读取账号信息响应失败 (HTTP {}, Content-Length {:?}): {}",
+                    status, content_length, error
+                );
+                if attempt < NAV_MAX_ATTEMPTS {
+                    log::warn!("{}，正在重试 ({}/{})", last_error, attempt, NAV_MAX_ATTEMPTS);
+                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        if !status.is_success() {
+            last_error = format!(
+                "获取账号信息失败 (HTTP {}, 响应体 {} 字节)",
+                status,
+                body.len()
+            );
+        } else {
+            match serde_json::from_slice(&body) {
+                Ok(json) => return Ok(json),
+                Err(error) => {
+                    last_error = format!(
+                        "解析账号信息响应失败 (HTTP {}, 响应体 {} 字节, Content-Length {:?}): {}",
+                        status,
+                        body.len(),
+                        content_length,
+                        error
+                    );
+                }
+            }
+        }
+
+        if attempt < NAV_MAX_ATTEMPTS {
+            log::warn!("{}，正在重试 ({}/{})", last_error, attempt, NAV_MAX_ATTEMPTS);
+            tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+        }
+    }
+
+    Err(format!("{}（已尝试 {} 次）", last_error, NAV_MAX_ATTEMPTS))
 }
 
 pub fn signout_account(account: &Account) -> Result<bool, String> {
