@@ -827,7 +827,7 @@ impl eframe::App for Myapp{
 
         static mut LAST_MONITOR_TIME: Option<std::time::Instant> = None;
     
-        unsafe {
+        /* unsafe {
         let should_monitor = match LAST_MONITOR_TIME {
             Some(time) => time.elapsed() > std::time::Duration::from_secs(30),
             None => true,
@@ -839,7 +839,7 @@ impl eframe::App for Myapp{
                 self.task_manager.get_results().len());
             LAST_MONITOR_TIME = Some(std::time::Instant::now());
         }
-        }
+        } */
 
         //检查policy
         if self.policy.is_none(){
