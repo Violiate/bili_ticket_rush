@@ -22,7 +22,6 @@ pub fn show(app: &mut Myapp,ctx:&egui::Context,uid:&i64){
     };
     let biliticket_uid;
     let biliticket_project_id;
-    let cookie_manager: Arc<CookieManager>;
     let id_bind;
     let screen_info: Option<ScreenInfo>;
     let ticket_info: Option<ScreenTicketInfo>;
@@ -30,12 +29,24 @@ pub fn show(app: &mut Myapp,ctx:&egui::Context,uid:&i64){
     
 
     app.is_loading = false;
+    let cookie_manager: Arc<CookieManager> = match app.bilibiliticket_list[biliticket_index].account.cookie_manager.clone() {
+        Some(cookie_manager) => cookie_manager,
+        None => {
+            let uid = app.bilibiliticket_list[biliticket_index].uid;
+            log::error!("账号 {} 的客户端未初始化", uid);
+            app.error_banner_active = true;
+            app.error_banner_text = format!("账号 {} 的客户端未初始化，请重新登录", uid);
+            app.error_banner_start_time = Some(std::time::Instant::now());
+            app.error_banner_opacity = 1.0;
+            app.confirm_ticket_info = None;
+            return;
+        }
+    };
     {
         let biliticket = &app.bilibiliticket_list[biliticket_index];
         
         biliticket_uid = biliticket.uid;
         biliticket_project_id = biliticket.project_info.as_ref().map(|p| p.id.unwrap_or(0).to_string());
-        cookie_manager = biliticket.account.cookie_manager.clone().unwrap();
         
         id_bind = match &biliticket.project_info {
             Some(project) => project.id_bind.unwrap_or(9),

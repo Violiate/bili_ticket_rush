@@ -37,6 +37,108 @@ jobs:
     - name: Build Debug
       if: matrix.debug == 'debug'
       run: cargo build --verbose
+    # macOS: 构建通用二进制并打包为 .app/.dmg（可选签名与公证）
+    - name: Prepare macOS universal build (release only)
+      if: matrix.os == 'macos-latest' && matrix.debug == 'release'
+      shell: bash
+      env:
+        APP_NAME: BiliTicketRush
+        BUNDLE_ID: com.biliticket.rush
+      run: |
+        set -euo pipefail
+        rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        cargo build --release --target aarch64-apple-darwin -p frontend
+        cargo build --release --target x86_64-apple-darwin -p frontend
+        mkdir -p target/universal-apple-darwin/release
+        lipo -create \
+          target/aarch64-apple-darwin/release/frontend \
+          target/x86_64-apple-darwin/release/frontend \
+          -output target/universal-apple-darwin/release/frontend
+        chmod +x target/universal-apple-darwin/release/frontend
+
+        # 创建 .app 目录结构与最小 Info.plist
+        APP_DIR="${APP_NAME}.app"
+        mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+        cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>CFBundleName</key>
+          <string>BiliTicketRush</string>
+          <key>CFBundleIdentifier</key>
+          <string>com.biliticket.rush</string>
+          <key>CFBundleExecutable</key>
+          <string>frontend</string>
+          <key>CFBundlePackageType</key>
+          <string>APPL</string>
+          <key>CFBundleShortVersionString</key>
+          <string>${{ github.ref_name }}</string>
+          <key>CFBundleVersion</key>
+          <string>${{ github.run_number }}</string>
+          <key>LSMinimumSystemVersion</key>
+          <string>11.0</string>
+        </dict>
+        </plist>
+        PLIST
+
+        cp target/universal-apple-darwin/release/frontend "$APP_DIR/Contents/MacOS/frontend"
+
+        # 生成默认未签名DMG（若后续配置了签名则会重新打包覆盖）
+        hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "${APP_NAME}-${{ github.ref_name }}.dmg"
+
+    - name: "Optional: codesign app if secrets provided"
+      if: matrix.os == 'macos-latest' && matrix.debug == 'release'
+      shell: bash
+      env:
+        APP_NAME: BiliTicketRush
+        CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+        MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+        MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      run: |
+        set -euo pipefail
+        if [ -z "${MACOS_CERT_P12_BASE64:-}" ] || [ -z "${CODESIGN_IDENTITY:-}" ]; then
+          echo "未配置 macOS 签名证书，跳过代码签名"
+          exit 0
+        fi
+        # 创建临时钥匙串并导入证书
+        KEYCHAIN="build.keychain"
+        security create-keychain -p temp "$KEYCHAIN"
+        security set-keychain-settings "$KEYCHAIN"
+        security unlock-keychain -p temp "$KEYCHAIN"
+        echo "$MACOS_CERT_P12_BASE64" | base64 --decode > cert.p12
+        security import cert.p12 -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -A
+        security list-keychains -d user -s "$KEYCHAIN"
+
+        # 对 .app 进行签名（启用运行时）并重新打包 DMG
+        codesign --deep --force --options runtime \
+          --sign "$CODESIGN_IDENTITY" "${APP_NAME}.app"
+        codesign --verify --deep --strict --verbose=2 "${APP_NAME}.app"
+        hdiutil create -volname "$APP_NAME" -srcfolder "${APP_NAME}.app" -ov -format UDZO "${APP_NAME}-${{ github.ref_name }}.dmg"
+
+    - name: "Optional: notarize and staple DMG"
+      if: matrix.os == 'macos-latest' && matrix.debug == 'release'
+      shell: bash
+      env:
+        APP_NAME: BiliTicketRush
+        APPLE_ID: ${{ secrets.APPLE_ID }}
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      run: |
+        set -euo pipefail
+        if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ] || [ -z "${APPLE_APP_PASSWORD:-}" ]; then
+          echo "未配置 Apple 公证凭据，跳过公证"
+          exit 0
+        fi
+        DMG="${APP_NAME}-${{ github.ref_name }}.dmg"
+        # 提交到Apple公证并等待结果
+        xcrun notarytool submit "$DMG" \
+          --apple-id "$APPLE_ID" \
+          --team-id "$APPLE_TEAM_ID" \
+          --password "$APPLE_APP_PASSWORD" \
+          --wait
+        # 订书钉（staple）公证票据到DMG
+        xcrun stapler staple "$DMG"
     - name: Copy artifacts on windows
       if: matrix.os == 'windows-latest'
       run: |
@@ -47,7 +149,13 @@ jobs:
       if: matrix.os != 'windows-latest'
       run: |
         mkdir -p target/output
-        cp target/${{matrix.debug}}/frontend target/output/${{ env.build_type }}-${{ matrix.build }}
+        # Linux拷贝二进制；macOS优先拷贝DMG和APP
+        if [[ "${{ matrix.os }}" == "macos-latest" && "${{ matrix.debug }}" == "release" ]]; then
+          cp BiliTicketRush-${{ github.ref_name }}.dmg target/output/${{ env.build_type }}-${{ matrix.build }}.dmg || true
+          tar -czf target/output/${{ env.build_type }}-${{ matrix.build }}.app.tgz BiliTicketRush.app || true
+        else
+          cp target/${{matrix.debug}}/frontend target/output/${{ env.build_type }}-${{ matrix.build }}
+        fi
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:

@@ -27,7 +27,7 @@ fn _x2<T: AsRef<[u8]>>(data: T) -> String {
     let _d = data.as_ref();
     let _l = _d.len();
     let _r: Vec<u8> = (0.._l).map(|i| _x1(_d[i], (i % 13) as u8)).collect();
-    _cx!(&_r).to_string()
+    String::from_utf8_lossy(&_r).into_owned()
 }
 
 fn _dx2<T: AsRef<str>>(data: T) -> String {
@@ -35,9 +35,9 @@ fn _dx2<T: AsRef<str>>(data: T) -> String {
     let _l = _s.len();
     let _r: Vec<u8> = (0.._l).map(|i| {
         let _x = _x1(_s[i], 0x44);
-        (_x + (i % 13) as u8) & 0xff
+        _x.wrapping_add((i % 13) as u8)
     }).collect();
-    _cx!(&_r).to_string()
+    String::from_utf8_lossy(&_r).into_owned()
 }
 
 
@@ -444,4 +444,21 @@ fn _obfuscated_delay() {
 
 fn hmac_sha256(key: &str, message: &str) -> Result<String, Box<dyn std::error::Error>> {
     _calc_hmac(key, message).map_err(|e| e.into())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn obfuscation_helpers_produce_valid_utf8() {
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let s = _x2(bytes.as_slice());
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+
+        let s2 = _x2("hello 世界 🎫".as_bytes());
+        assert!(std::str::from_utf8(s2.as_bytes()).is_ok());
+
+        let s3 = _dx2("任意文本 abc 123 \u{ee00}\u{ee00}\u{ee00}\u{ee00}\u{ee00}\u{ee00}\u{ee00}\u{ee00}");
+        assert!(std::str::from_utf8(s3.as_bytes()).is_ok());
+    }
 }

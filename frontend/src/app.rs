@@ -552,6 +552,7 @@ impl Myapp{
                     }
                 }
                 TaskResult::GetAllorderRequestResult(order_result) => {
+                    self.orderlist_requesting = false;
                     // 处理订单请求结果
                     if order_result.success {
                         self.total_order_data = Some(OrderData {
@@ -571,6 +572,7 @@ impl Myapp{
                             None => {
                                 log::error!("获取project信息失败: {}", order_result.message);
                                 self.is_loading = false;
+                                self.confirm_ticket_info = None;
                                 // 保留时间戳，避免无限重试（遵循5秒延迟）
                                 continue;
                             }
@@ -601,6 +603,7 @@ impl Myapp{
 
                 }
                 TaskResult::GetBuyerInfoResult(get_buyerinfo_result)=>{
+                    self.is_loading = false;
                     if get_buyerinfo_result.success{
                         let response = match get_buyerinfo_result.buyer_info {
                             Some(ref info) => info,
@@ -905,7 +908,7 @@ impl eframe::App for Myapp{
                 if elapsed < 4.5 {
                     // 如果超过2秒，开始淡出
                     if elapsed > 4.0 {
-                        self.error_banner_opacity = 1.0 - (elapsed - 2.0) * 2.0; // 0.5秒内从1.0淡到0
+                        self.error_banner_opacity = (1.0 - (elapsed - 4.0) * 2.0).max(0.0); // 0.5秒内从1.0淡到0
                     }
                     
                     // 绘制横幅
@@ -1009,7 +1012,18 @@ impl eframe::App for Myapp{
             }
             else{
                 
-                let account = self.account_manager.accounts.iter_mut().find(|a| a.uid == account_id.clone()).unwrap();
+                let account = match self.account_manager.accounts.iter_mut().find(|a| a.uid == account_id.clone()) {
+                    Some(account) => account,
+                    None => {
+                        log::error!("未找到账号ID为 {} 的账号", account_id);
+                        self.error_banner_active = true;
+                        self.error_banner_text = format!("未找到账号ID为 {} 的账号", account_id);
+                        self.error_banner_start_time = Some(std::time::Instant::now());
+                        self.error_banner_opacity = 1.0;
+                        self.show_orderlist_window = None;
+                        return;
+                    }
+                };
                 let cookie_manager = match account.cookie_manager.clone() {
                     Some(cookie_manager) => cookie_manager,
                     None => {
@@ -1077,7 +1091,19 @@ impl eframe::App for Myapp{
                 
                 if should_request {
                     log::info!("提交获取{}project请求 ", self.ticket_id);
-                    let cookie_manager = bilibili_ticket.account.cookie_manager.clone().unwrap();
+                    let cookie_manager = match bilibili_ticket.account.cookie_manager.clone() {
+                        Some(cookie_manager) => cookie_manager,
+                        None => {
+                            log::error!("账号 {} 的客户端未初始化", bilibili_ticket.uid);
+                            self.error_banner_active = true;
+                            self.error_banner_text = format!("账号 {} 的客户端未初始化，请重新登录", bilibili_ticket.uid);
+                            self.error_banner_start_time = Some(std::time::Instant::now());
+                            self.error_banner_opacity = 1.0;
+                            self.is_loading = false;
+                            self.show_screen_info = None;
+                            return;
+                        }
+                    };
                     {
                         let request = TaskRequest::GetTicketInfoRequest(GetTicketInfoRequest{
                             task_id: "".to_string(),
@@ -1146,7 +1172,19 @@ impl eframe::App for Myapp{
                 }
                 if should_request{
                     log::info!("提交获取购票人信息请求");
-                    let cookie_manager = bilibili_ticket.account.cookie_manager.clone().unwrap();
+                    let cookie_manager = match bilibili_ticket.account.cookie_manager.clone() {
+                        Some(cookie_manager) => cookie_manager,
+                        None => {
+                            log::error!("账号 {} 的客户端未初始化", bilibili_ticket.uid);
+                            self.error_banner_active = true;
+                            self.error_banner_text = format!("账号 {} 的客户端未初始化，请重新登录", bilibili_ticket.uid);
+                            self.error_banner_start_time = Some(std::time::Instant::now());
+                            self.error_banner_opacity = 1.0;
+                            self.is_loading = false;
+                            self.confirm_ticket_info = None;
+                            return;
+                        }
+                    };
                      {
                         let request = TaskRequest::GetBuyerInfoRequest(GetBuyerInfoRequest{
                             task_id: "".to_string(),

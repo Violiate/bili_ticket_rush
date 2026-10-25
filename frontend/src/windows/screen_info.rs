@@ -4,11 +4,18 @@ use eframe::egui;
 use serde_json::Value;
 
 pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
-    let bilibili_ticket = app
+    let bilibili_ticket = match app
         .bilibiliticket_list
         .iter_mut()
         .find(|ticket| ticket.uid == uid)
-        .unwrap();
+    {
+        Some(bilibili_ticket) => bilibili_ticket,
+        None => {
+            log::error!("未找到uid为{}的抢票信息", uid);
+            app.show_screen_info = None;
+            return;
+        }
+    };
     let mut window_open = app.show_screen_info.is_some();
 
     let ticket_data = match bilibili_ticket.project_info.clone() {

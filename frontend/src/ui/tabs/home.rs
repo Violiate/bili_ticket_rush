@@ -72,15 +72,26 @@ fn ticket_input_area(ui: &mut egui::Ui, app: &mut Myapp) {
                     return
                 }
             };
+            let selected_account = match app.account_manager.accounts
+                .iter()
+                .find(|a| a.uid == select_uid)
+            {
+                Some(account) => account,
+                None => {
+                    log::error!("未找到uid为{}的账号", select_uid);
+                    app.error_banner_active = true;
+                    app.error_banner_text = format!("未找到uid为{}的账号，请重新选择", select_uid);
+                    app.error_banner_start_time = Some(std::time::Instant::now());
+                    app.error_banner_opacity = 1.0;
+                    return;
+                }
+            };
             let bilibili_ticket: BilibiliTicket = BilibiliTicket::new(
 
                 &app.grab_mode,
                 &app.default_ua,
                 &app.custom_config,
-                &app.account_manager.accounts
-                    .iter()
-                    .find(|a| a.uid == select_uid)
-                    .unwrap(),
+                selected_account,
 
                 &app.push_config,
                 &app.status_delay,

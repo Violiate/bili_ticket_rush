@@ -218,6 +218,10 @@ fn request_image_async(ctx: egui::Context,app:&Myapp,url: String) {
 
     // 标记为正在加载
     log::debug!("<正在加载图片>: {}", url);
+    if app.account_manager.accounts.is_empty() {
+        log::error!("没有可用账号，无法加载图片");
+        return;
+    }
     ctx.memory_mut(|mem| mem.data.insert_temp(egui::Id::new(format!("loading_{}", url)), true));
     
     // 启动异步加载线程

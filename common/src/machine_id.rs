@@ -165,7 +165,7 @@ fn _get_machine_data_dummy() -> (String, Vec<u8>) {
 
 
 fn _get_obfuscated_platform() -> String {
-    let _raw_os = unsafe { std::mem::transmute::<&str, &[u8]>(std::env::consts::OS) };
+    let _raw_os = std::env::consts::OS.as_bytes();
     let _encoded = _raw_os.iter().enumerate()
         .map(|(i, &b)| b ^ (0x20 + (i % 7) as u8))
         .collect::<Vec<u8>>();
@@ -175,10 +175,10 @@ fn _get_obfuscated_platform() -> String {
         .map(|(i, &b)| b ^ (0x20 + (i % 7) as u8))
         .collect::<Vec<u8>>();
     
-    let _os_str = unsafe { std::str::from_utf8_unchecked(&_decoded) };
+    let _os_str = String::from_utf8_lossy(&_decoded);
     
    
-    match _os_str {
+    match _os_str.as_ref() {
         "windows" => "Windows".to_string(),
         "linux" => "Linux".to_string(),
         "macos" => "Darwin".to_string(),
@@ -438,4 +438,14 @@ fn _fetch_attributes() -> BTreeMap<String, String> {
     }
     
     _metadata
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_name_is_safe() {
+        let p = _get_obfuscated_platform();
+        assert!(!p.is_empty());
+    }
 }

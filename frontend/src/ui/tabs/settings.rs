@@ -153,7 +153,7 @@ pub fn globle_setting(app: &mut Myapp, ui: &mut egui::Ui){
     ui.horizontal(|ui| {
         
         common_input(ui, "请输入账号1预填手机号：", &mut app.custom_config.preinput_phone1, "请输入账号1绑定的手机号",true);
-        common_input(ui, "请输入账号2预填手机号：", &mut app.custom_config.preinput_phone1, "请输入账号2绑定的手机号，没有可不填",true);
+        common_input(ui, "请输入账号2预填手机号：", &mut app.custom_config.preinput_phone2, "请输入账号2绑定的手机号，没有可不填",true);
     });
     ui.separator();
     ui.horizontal(|ui|{
@@ -274,7 +274,7 @@ pub fn push_setting(app: &mut Myapp, ui: &mut egui::Ui){
             });
             ui.horizontal(|ui|{
                 
-                common_input(ui, "邮箱账号：",&mut app.push_config.smtp_config.smtp_from,"请输入发件人邮箱",true);
+                common_input(ui, "邮箱账号：",&mut app.push_config.smtp_config.smtp_username,"请输入发件人邮箱",true);
                 dynamic_caculate_space(ui, 180.0);
                 common_input(ui, "授权密码：",&mut app.push_config.smtp_config.smtp_password,"请输入授权密码",true);
                 dynamic_caculate_space(ui, 180.0);

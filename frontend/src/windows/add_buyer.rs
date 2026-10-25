@@ -16,7 +16,18 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: &str) {
         Some(account) => account,
         None => return,
     };
-    let select_cookie_manager = select_account.cookie_manager.clone().unwrap();
+    let select_cookie_manager = match select_account.cookie_manager.clone() {
+        Some(select_cookie_manager) => select_cookie_manager,
+        None => {
+            log::error!("账号 {} 的客户端未初始化", select_account.uid);
+            app.error_banner_active = true;
+            app.error_banner_text = format!("账号 {} 的客户端未初始化，请重新登录", select_account.uid);
+            app.error_banner_start_time = Some(std::time::Instant::now());
+            app.error_banner_opacity = 1.0;
+            app.show_add_buyer_window = None;
+            return;
+        }
+    };
     let mut window_open = app.show_add_buyer_window.is_some();
     
     egui::Window::new("添加购票人")

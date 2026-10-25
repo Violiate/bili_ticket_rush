@@ -7,7 +7,7 @@ use std::sync::Arc;
 pub fn render(app: &mut Myapp, ui: &mut egui::Ui){
     ui.heading("我的账户");
     ui.separator();
-    let mut example_account = Account{
+    let example_account = Account{
         uid: 0,
         name: "请登录账号".to_string(),
         vip_label: "未登录，请登录账号".to_string(),
@@ -28,27 +28,12 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui){
     // 加载默认头像
     load_default_avatar(ui.ctx(),app);
 
-    let account_to_show = app.account_manager.accounts.first_mut().unwrap_or(&mut example_account);
-    let avatar_texture = load_user_avatar(ui.ctx(), account_to_show.cookie_manager.clone(), account_to_show);
-
-    if let Some(texture) = &avatar_texture{
-        show_user(
-            ui,
-            texture,account_to_show,
-            &mut app.delete_account,
-            &mut app.show_login_windows ,
-            &mut app.config,
-            &mut app.account_switch,
-            &mut app.show_add_buyer_window,
-            &mut app.show_orderlist_window,
-            );
-}
-    else {
-        // 如果头像加载失败，显示默认头像
-        if let Some(texture) = &app.default_avatar_texture {
+    if app.account_manager.accounts.is_empty() {
+        if let Some(texture) = app.default_avatar_texture.clone() {
             show_user(
                 ui,
-                texture,account_to_show,
+                &texture,
+                &example_account,
                 &mut app.delete_account,
                 &mut app.show_login_windows ,
                 &mut app.config,
@@ -57,24 +42,64 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui){
                 &mut app.show_orderlist_window,
                 );
         }
+    } else {
+        let account_count = app.account_manager.accounts.len();
+        for index in 0..account_count {
+            let cookie_manager = app.account_manager.accounts[index].cookie_manager.clone();
+            let avatar_texture = load_user_avatar(ui.ctx(), cookie_manager, &mut app.account_manager.accounts[index]);
+            let texture = avatar_texture.or_else(|| app.default_avatar_texture.clone());
+            if let Some(texture) = texture {
+                show_user(
+                    ui,
+                    &texture,
+                    &app.account_manager.accounts[index],
+                    &mut app.delete_account,
+                    &mut app.show_login_windows ,
+                    &mut app.config,
+                    &mut app.account_switch,
+                    &mut app.show_add_buyer_window,
+                    &mut app.show_orderlist_window,
+                    );
+            }
+            ui.separator();
+        }
+        if account_count < 2 {
+            if let Some(texture) = app.default_avatar_texture.clone() {
+                show_user(
+                    ui,
+                    &texture,
+                    &example_account,
+                    &mut app.delete_account,
+                    &mut app.show_login_windows ,
+                    &mut app.config,
+                    &mut app.account_switch,
+                    &mut app.show_add_buyer_window,
+                    &mut app.show_orderlist_window,
+                    );
+                ui.separator();
+            }
+        }
+        let account_count = 0;
+        for index in 0..account_count {
+            let cookie_manager = app.account_manager.accounts[index].cookie_manager.clone();
+            let avatar_texture = load_user_avatar(ui.ctx(), cookie_manager, &mut app.account_manager.accounts[index]);
+            let texture = avatar_texture.or_else(|| app.default_avatar_texture.clone());
+            if let Some(texture) = texture {
+                show_user(
+                    ui,
+                    &texture,
+                    &app.account_manager.accounts[index],
+                    &mut app.delete_account,
+                    &mut app.show_login_windows ,
+                    &mut app.config,
+                    &mut app.account_switch,
+                    &mut app.show_add_buyer_window,
+                    &mut app.show_orderlist_window,
+                    );
+            }
+            ui.separator();
+        }
     }
-//show_user_control(ui,&app.user_info);
-ui.separator();
-if let Some(texture) = &app.default_avatar_texture {
-    let account_to_show = app.account_manager.accounts.get(1).unwrap_or(&example_account);
-    show_user(
-        ui,
-        texture,account_to_show,
-        &mut app.delete_account,
-        &mut app.show_login_windows ,
-        &mut app.config,
-        &mut app.account_switch,
-        &mut app.show_add_buyer_window,
-        &mut app.show_orderlist_window,
-        );
-
-
-}
 ui.separator();
 
 
@@ -150,7 +175,8 @@ fn load_user_avatar(ctx: &egui::Context, cookie_manager: Option<Arc<CookieManage
     if account.is_login && cookie_manager.is_some() {
         if let Some(avatar_url) = &account.avatar_url {
             // 尝试加载用户头像
-            let texture_option = load_texture_from_url(ctx, cookie_manager.unwrap(), avatar_url, "user_avatar");
+            let texture_name = format!("user_avatar_{}", account.uid);
+            let texture_option = load_texture_from_url(ctx, cookie_manager.unwrap(), avatar_url, &texture_name);
 
             account.avatar_texture = texture_option.clone();
             return texture_option;
@@ -161,6 +187,9 @@ fn load_user_avatar(ctx: &egui::Context, cookie_manager: Option<Arc<CookieManage
 }
 // 加载默认头像
 fn load_default_avatar(ctx: &egui::Context, app: &mut Myapp) {
+    if app.default_avatar_texture.is_some() {
+        return;
+    }
     // 使用include_bytes!宏将图片直接嵌入到二进制文件中
     // 路径是相对于项目根目录的
     let default_avatar_bytes = include_bytes!("../../../assets/default_avatar.jpg");

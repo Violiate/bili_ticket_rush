@@ -58,7 +58,7 @@ pub struct TaskManagerImpl {
 }
 
 enum TaskMessage {
-    SubmitTask(TaskRequest),
+    SubmitTask((String, TaskRequest)),
     CancelTask(String),
     Shutdown,
 }
@@ -84,8 +84,7 @@ impl TaskManager for TaskManagerImpl {
             rt.block_on(async {
                 while let Some(msg) = task_rx.recv().await {
                     match msg {
-                        TaskMessage::SubmitTask(request) => {
-                            let task_id = uuid::Uuid::new_v4().to_string();
+        TaskMessage::SubmitTask((task_id, request)) => {
                             let result_tx = result_tx.clone();
                             
                             // 根据任务类型处理
@@ -116,7 +115,6 @@ impl TaskManager for TaskManagerImpl {
                                     });
                                 }
                                 TaskRequest::LoginSmsRequest(login_sms_req) => {
-                                    let task_id = uuid::Uuid::new_v4().to_string();
                                     let phone = login_sms_req.phone.clone();
                                     let client = login_sms_req.client.clone();
                                     let custom_config = login_sms_req.custom_config.clone();
@@ -188,7 +186,6 @@ impl TaskManager for TaskManagerImpl {
                                 
                                 }
                                 TaskRequest::PushRequest(push_req) => {
-                                    let task_id = uuid::Uuid::new_v4().to_string();
                                     let push_config = push_req.push_config.clone();
                                     let title = push_req.title.clone();
                                     let message = push_req.message.clone();
@@ -229,7 +226,6 @@ impl TaskManager for TaskManagerImpl {
                                  
                                 }
                                 TaskRequest::SubmitLoginSmsRequest(login_sms_req) => {
-                                    let task_id = uuid::Uuid::new_v4().to_string();
                                     let phone = login_sms_req.phone.clone();
                                     let client = login_sms_req.client.clone();
                                     let captcha_key = login_sms_req.captcha_key.clone();
@@ -274,43 +270,33 @@ impl TaskManager for TaskManagerImpl {
                                 TaskRequest::GetAllorderRequest(get_order_req) => {
                                     let cookie_manager = get_order_req.cookie_manager.clone();
                                     let result_tx = result_tx.clone();
-                                    let task_id = get_order_req.task_id;
                                     let account_id = get_order_req.account_id.clone();
                                     let cookies = get_order_req.cookies.clone();
                                     tokio::spawn(async move{
                                         log::info!("正在获取全部订单 ID: {}", task_id);
-                                        let response = get_orderlist(cookie_manager).await;
-                                        let success = response.is_ok();
-                                        let data = match &response {
-                                            Ok(order_resp) => {order_resp.clone()},
+                                        let (success, message, order_info) = match get_orderlist(cookie_manager).await {
+                                            Ok(order_resp) => {
+                                                let msg = format!("获取全部订单成功: {}", order_resp.data.total);
+                                                (true, msg, Some(order_resp))
+                                            }
                                             Err(err) => {
                                                 log::error!("获取全部订单失败: {}", err);
-                                                return;
+                                                (false, err, None)
                                             }
                                         };
-                                        let message = match &response {
-                                            Ok(msg) => {format!("获取全部订单成功: {}", msg.data.total)},
-                                            Err(err) => {
-                                                log::error!("获取全部订单失败: {}", err);
-                                                err.to_string()
-                                            },
-                                        };
-
                                         let task_result = TaskResult::GetAllorderRequestResult(GetAllorderRequestResult {
                                             task_id: task_id.clone(),
                                             success,
                                             message,
-                                            order_info: Some(data.clone()),
+                                            order_info,
                                             account_id: account_id.clone(),
                                             timestamp: std::time::Instant::now(),
                                         });
-
                                         let _ = result_tx.send(task_result).await;
                                     });
                                 }
                                 TaskRequest::GetTicketInfoRequest(get_ticketinfo_req) => {
                                     let cookie_manager = get_ticketinfo_req.cookie_manager.clone();
-                                    let task_id = get_ticketinfo_req.task_id.clone();
                                     let result_tx = result_tx.clone();
                                     let project_id = get_ticketinfo_req.project_id.clone();
                                     let uid = get_ticketinfo_req.uid.clone();
@@ -354,7 +340,6 @@ impl TaskManager for TaskManagerImpl {
                                 }
                                 TaskRequest::GetBuyerInfoRequest(get_buyerinfo_req)=>{
                                     let cookie_manager = get_buyerinfo_req.cookie_manager.clone();
-                                    let task_id = get_buyerinfo_req.task_id.clone();
                                     let result_tx = result_tx.clone();
                                     let uid = get_buyerinfo_req.uid.clone();
                                     tokio::spawn(async move{
@@ -554,7 +539,8 @@ impl TaskManager for TaskManagerImpl {
                                                                   uid,
                                                                   &result_tx,
                                                                   &grab_ticket_req,
-                                                                  &buyer_info
+                                                                  &buyer_info,
+                                                                  &cancel_flag,
                                                                 ).await ;
                                                                 if success && !retry_limit {
                                                                     log::info!("抢票流程结束，退出定时抢票模式");
@@ -692,7 +678,8 @@ impl TaskManager for TaskManagerImpl {
                                                                    uid,
                                                                    &result_tx,
                                                                    &grab_ticket_req,
-                                                                   &buyer_info
+                                                                   &buyer_info,
+                                                                   &cancel_flag,
                                                                  ).await ;
                                                                 if success {
                                                                     log::info!("抢票流程结束，退出捡漏模式");
@@ -898,7 +885,8 @@ impl TaskManager for TaskManagerImpl {
                                                                            uid,
                                                                            &result_tx,
                                                                            &local_grab_request,
-                                                                           &buyer_info
+                                                                           &buyer_info,
+                                                                           &cancel_flag,
                                                                          ).await ;
                                                                 if success {
                                                                     log::info!("抢票流程结束，退出捡漏模式");
@@ -1150,7 +1138,7 @@ impl TaskManager for TaskManagerImpl {
         }
         
         // 发送任务
-        if let Err(e) = self.task_sender.blocking_send(TaskMessage::SubmitTask(request)) {
+        if let Err(e) = self.task_sender.blocking_send(TaskMessage::SubmitTask((task_id.clone(), request))) {
             return Err(format!("无法提交任务: {}", e));
         }
         
@@ -1188,7 +1176,13 @@ impl TaskManager for TaskManagerImpl {
             .grab_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        registry.get(task_id).map(|_| TaskStatus::Running)
+        registry.get(task_id).map(|entry| {
+            if entry.cancel_flag.load(Ordering::Relaxed) {
+                TaskStatus::Failed("取消中".to_string())
+            } else {
+                TaskStatus::Running
+            }
+        })
     }
 
     fn list_running_tasks(&self) -> Vec<RunningTaskInfo> {
@@ -1233,6 +1227,7 @@ async fn handle_grab_ticket(
     result_tx: &mpsc::Sender<TaskResult>,
     grab_ticket_req: &GrabTicketRequest,
     buyer_info: &Vec<BuyerInfo>,
+    cancel_flag: &Arc<AtomicBool>,
 ) -> (bool, bool) {
     // 确认订单
     match confirm_ticket_order(cookie_manager.clone(), project_id, token).await {
@@ -1253,6 +1248,7 @@ async fn handle_grab_ticket(
                 task_id,
                 uid,
                 result_tx,
+                cancel_flag,
             ).await {
                 
                 return (success,retry_limit);
@@ -1281,6 +1277,7 @@ async fn try_create_order(
     task_id: &str,
     uid: i64,
     result_tx: &mpsc::Sender<TaskResult>,
+    cancel_flag: &Arc<AtomicBool>,
 ) -> Option<(
     bool,
     bool  // 第二个参数标记是因为达到重试上限
@@ -1290,6 +1287,10 @@ async fn try_create_order(
     
     // 下单循环
     loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            log::info!("下单任务已取消");
+            return Some((true,false));
+        }
         if order_retry_count >= 3 {
             need_retry = true;
         }
@@ -1448,9 +1449,24 @@ async fn try_create_order(
         
         // 增加重试计数并等待
         order_retry_count += 1;
-        if grab_ticket_req.grab_mode == 2 && order_retry_count >= 30 {
-            log::error!("捡漏模式下单失败，已达最大重试次数，放弃该票种抢票，准备检测其他票种继续捡漏");
-            return Some((false,true)); // 捡漏模式下单失败，放弃该票种抢票
+        if grab_ticket_req.grab_mode == 2 {
+            if order_retry_count >= 30 {
+                log::error!("捡漏模式下单失败，已达最大重试次数，放弃该票种抢票，准备检测其他票种继续捡漏");
+                return Some((false,true));
+            }
+        } else if order_retry_count >= 60 {
+            log::error!("下单失败，已达最大重试次数(60)，停止本任务");
+            let _ = result_tx.send(TaskResult::GrabTicketResult(GrabTicketResult {
+                task_id: task_id.to_string(),
+                uid,
+                success: false,
+                message: "下单失败，已达最大重试次数(60)".to_string(),
+                order_id: None,
+                pay_token: None,
+                pay_result: None,
+                confirm_result: None,
+            })).await;
+            return Some((true,false));
         }
         tokio::time::sleep(tokio::time::Duration::from_secs_f32(0.4)).await;
         //降低速度，不带来b站服务器压力

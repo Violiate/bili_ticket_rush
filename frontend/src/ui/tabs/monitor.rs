@@ -38,7 +38,6 @@ fn badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32) {
 }
 
 pub fn render(app: &mut Myapp, ui: &mut egui::Ui){
-    app.show_log_window = true;
 
     // 配色（卡片为暗色主题上的亮色岛屿，与 account 标签页风格一致）
     let c_dark = egui::Color32::from_rgb(55, 58, 74);
@@ -68,6 +67,18 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui){
         ui.label(egui::RichText::new("🎫 运行中任务").size(17.0).strong());
         ui.add_space(6.0);
         badge(ui, &running_tasks.len().to_string(), c_pink);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let log_btn_text = if app.show_log_window { "隐藏日志" } else { "查看日志" };
+            let log_btn = egui::Button::new(
+                egui::RichText::new(log_btn_text).color(egui::Color32::WHITE).size(13.0),
+            )
+            .fill(c_slate)
+            .rounding(7.0)
+            .min_size(egui::vec2(72.0, 24.0));
+            if ui.add(log_btn).clicked() {
+                app.show_log_window = !app.show_log_window;
+            }
+        });
     });
     ui.add_space(8.0);
 

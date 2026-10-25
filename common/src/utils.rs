@@ -34,6 +34,9 @@ impl Config{
     pub fn load_config() -> io::Result<Self>{
         let raw_context = fs::read_to_string("./config")?;
         let content = raw_context.split("%").collect::<Vec<&str>>();
+        if content.len() < 2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "config 格式错误：缺少 IV 或密文"));
+        }
         // base64解码后解密
         let iv = BASE64.decode(content[0].trim())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -314,9 +317,10 @@ pub fn load_texture_from_url(ctx: &eframe::egui::Context, cookie_manager: Arc<Co
 
 
 fn gen_machine_id_bytes_128b()->Vec<u8> {
-    let id: String = machine_uid::get().unwrap();
-    println!("{}", id);
-    id[..16].as_bytes().to_vec()
+    let id: String = machine_uid::get().unwrap_or_else(|_| String::new());
+    let mut key = id.as_bytes().to_vec();
+    key.resize(16, 0u8);
+    key
 
 }
 // 加密函数
@@ -487,5 +491,16 @@ pub async fn get_now_time(client: &Client) -> i64 {
         local_sec
     } else {
         now_sec
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_key_is_16_bytes() {
+        let key = gen_machine_id_bytes_128b();
+        assert_eq!(key.len(), 16);
     }
 }

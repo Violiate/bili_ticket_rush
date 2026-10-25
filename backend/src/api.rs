@@ -272,7 +272,10 @@ pub async fn poll_qrcode_login(qrcode_key: &str,user_agent: Option<&str>) ->QrCo
     };
     
     
-    let code = json["data"]["code"].as_i64().unwrap_or(-1);
+    let code = json["data"]["code"]
+        .as_i64()
+        .or_else(|| json["code"].as_i64().filter(|&c| c != 0))
+        .unwrap_or(-1);
     match code {
         0 => {
             //json获取cookie
@@ -302,7 +305,10 @@ pub async fn poll_qrcode_login(qrcode_key: &str,user_agent: Option<&str>) ->QrCo
             //return QrCodeLoginStatus::Pending
         },
         _ => {
-            let message = json["message"].as_str().unwrap_or("未知错误");
+            let message = json["data"]["message"]
+                .as_str()
+                .or_else(|| json["message"].as_str())
+                .unwrap_or("未知错误");
 
             return QrCodeLoginStatus::Failed(message.to_string())
         }
@@ -582,7 +588,13 @@ pub async fn create_order(
     let data = match biliticket.id_bind {
         0 => {
             // 不实名制购票人信息
-            let no_bind_buyer_info = biliticket.no_bind_buyer_info.clone().unwrap();
+            let no_bind_buyer_info = match biliticket.no_bind_buyer_info.clone() {
+                Some(info) => info,
+                None => {
+                    log::error!("非实名购票人信息缺失，无法下单");
+                    return Err(999);
+                }
+            };
                 
             let data = json!({
                 "project_id": project_id.parse::<i64>().unwrap_or(0),
@@ -678,7 +690,7 @@ pub async fn create_order(
     let code_value = value.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     
     // 只要有一个错误码不是0，就认为有错误
-    if errno_value != 0 || (errno_value == -1 && code_value != 0) {
+    if (errno_value != 0 && errno_value != -1) || (errno_value == -1 && code_value != 0) {
         return Err(if errno_value != -1 { 
             errno_value as i32 
         } else { 
@@ -805,4 +817,52 @@ pub async fn random_click_position(
         "origin": origin,
         "now": now
     })
+}
+
+
+fn extract_qrcode_poll_code(json: &Value) -> i64 {
+    json["data"]["code"]
+        .as_i64()
+        .or_else(|| json["code"].as_i64().filter(|&c| c != 0))
+        .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qrcode_poll_uses_nested_data_code() {
+        let unscanned = json!({
+            "code": 0,
+            "message": "0",
+            "ttl": 1,
+            "data": {
+                "url": "",
+                "refresh_token": "",
+                "timestamp": 0,
+                "code": 86101,
+                "message": "未扫码"
+            }
+        });
+        assert_eq!(extract_qrcode_poll_code(&unscanned), 86101);
+
+        let scanned = json!({
+            "code": 0,
+            "data": { "code": 86090, "message": "二维码已扫码未确认" }
+        });
+        assert_eq!(extract_qrcode_poll_code(&scanned), 86090);
+
+        let success = json!({
+            "code": 0,
+            "data": { "code": 0, "message": "" }
+        });
+        assert_eq!(extract_qrcode_poll_code(&success), 0);
+
+        let api_err = json!({
+            "code": -400,
+            "message": "请求错误"
+        });
+        assert_eq!(extract_qrcode_poll_code(&api_err), -400);
+    }
 }
