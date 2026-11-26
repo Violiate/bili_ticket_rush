@@ -12,6 +12,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
         debug: [debug, release]
@@ -30,6 +31,13 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
     - uses: actions/checkout@v4
+    - name: Setup Rust toolchain (1.96.0)
+      shell: bash
+      run: |
+        rustup toolchain install 1.96.0 --profile minimal
+        rustup default 1.96.0
+        rustc --version
+        cargo --version
     - name: Print github.ref
       run: echo "${{ github.ref }}"
     - name: Build Release
