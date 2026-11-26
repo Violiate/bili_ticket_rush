@@ -59,7 +59,22 @@ jobs:
         # 创建 .app 目录结构与最小 Info.plist
         APP_DIR="${APP_NAME}.app"
         mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-        cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+
+        ICON_PLIST_ENTRY=""
+        if [ -f "frontend/assets/app_icon.png" ]; then
+          ICONSET_DIR="$(mktemp -d)/AppIcon.iconset"
+          mkdir -p "$ICONSET_DIR"
+          for sz in 16 32 128 256 512; do
+            sips -z $sz $sz frontend/assets/app_icon.png --out "$ICONSET_DIR/icon_${sz}x${sz}.png" >/dev/null
+            sz2=$((sz * 2))
+            sips -z $sz2 $sz2 frontend/assets/app_icon.png --out "$ICONSET_DIR/icon_${sz}x${sz}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$ICONSET_DIR" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
+          ICON_PLIST_ENTRY="  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>"
+        fi
+
+        cat > "$APP_DIR/Contents/Info.plist" <<PLIST
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
@@ -78,6 +93,7 @@ jobs:
           <string>${{ github.run_number }}</string>
           <key>LSMinimumSystemVersion</key>
           <string>11.0</string>
+        ${ICON_PLIST_ENTRY}
         </dict>
         </plist>
         PLIST

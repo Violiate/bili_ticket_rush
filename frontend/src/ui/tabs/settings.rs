@@ -1,213 +1,291 @@
 use eframe::egui;
-use crate::app::Myapp;
-use common::utils::save_config;
 
-fn on_switch(ui: &mut egui::Ui, output_char: &str, on: &mut bool) -> egui::Response {
-    ui.label(
-        egui::RichText::new(output_char)
-              .size(15.0)                               
-              .color(egui::Color32::from_rgb(0,0,0))  
+use crate::app::{normalize_fullwidth_ascii, Myapp};
 
-              .strong()   
-    );
-    // 开关尺寸
-    let width = 55.0;
-    let height = 26.0;
-    
-    // 分配空间并获取响应
-    let (rect, mut response) = ui.allocate_exact_size(
-        egui::vec2(width, height), 
-        egui::Sense::click()
-    );
-    
-    // 处理点击
-    if response.clicked() {
-        *on = !*on;
-        response.mark_changed();
-    }
-    
-    // 动画参数
-    let animation_progress = ui.ctx().animate_bool(response.id, *on);
-    let radius = height / 2.0;
-    
-    // 计算滑块位置
-    let circle_x = rect.left() + radius + animation_progress * (width - height);
-    
-    // 绘制轨道
-    ui.painter().rect_filled(
-        rect.expand(-1.0), 
-        radius, 
-        if *on {
-            egui::Color32::from_rgb(102,204,255)  // 启用状态颜色
+struct SettingsPalette {
+    card_fill: egui::Color32,
+    card_border: egui::Color32,
+    text_primary: egui::Color32,
+    text_secondary: egui::Color32,
+    text_hint: egui::Color32,
+    accent: egui::Color32,
+    accent_border: egui::Color32,
+    switch_off: egui::Color32,
+    unselected_fill: egui::Color32,
+    unselected_text: egui::Color32,
+    unselected_border: egui::Color32,
+    dirty_bg: egui::Color32,
+    dirty_text: egui::Color32,
+    saved_bg: egui::Color32,
+    saved_text: egui::Color32,
+    error_bg: egui::Color32,
+    error_text: egui::Color32,
+}
+
+impl SettingsPalette {
+    fn from_dark_mode(dark_mode: bool) -> Self {
+        if dark_mode {
+            Self {
+                card_fill: egui::Color32::from_rgb(36, 38, 46),
+                card_border: egui::Color32::from_rgb(62, 66, 80),
+                text_primary: egui::Color32::from_rgb(235, 238, 245),
+                text_secondary: egui::Color32::from_rgb(185, 190, 205),
+                text_hint: egui::Color32::from_rgb(142, 148, 164),
+                accent: egui::Color32::from_rgb(45, 136, 245),
+                accent_border: egui::Color32::from_rgb(28, 108, 212),
+                switch_off: egui::Color32::from_rgb(92, 96, 112),
+                unselected_fill: egui::Color32::from_rgb(48, 52, 64),
+                unselected_text: egui::Color32::from_rgb(218, 222, 232),
+                unselected_border: egui::Color32::from_rgb(76, 82, 98),
+                dirty_bg: egui::Color32::from_rgb(82, 58, 24),
+                dirty_text: egui::Color32::from_rgb(255, 200, 110),
+                saved_bg: egui::Color32::from_rgb(26, 66, 40),
+                saved_text: egui::Color32::from_rgb(122, 230, 156),
+                error_bg: egui::Color32::from_rgb(80, 28, 28),
+                error_text: egui::Color32::from_rgb(255, 140, 140),
+            }
         } else {
-            egui::Color32::from_rgb(150, 150, 150)  // 禁用状态颜色
+            Self {
+                card_fill: egui::Color32::from_rgb(248, 249, 252),
+                card_border: egui::Color32::from_rgb(214, 218, 230),
+                text_primary: egui::Color32::from_rgb(32, 36, 48),
+                text_secondary: egui::Color32::from_rgb(82, 88, 104),
+                text_hint: egui::Color32::from_rgb(122, 128, 144),
+                accent: egui::Color32::from_rgb(45, 136, 245),
+                accent_border: egui::Color32::from_rgb(25, 106, 208),
+                switch_off: egui::Color32::from_rgb(168, 174, 188),
+                unselected_fill: egui::Color32::from_rgb(234, 237, 244),
+                unselected_text: egui::Color32::from_rgb(48, 54, 68),
+                unselected_border: egui::Color32::from_rgb(194, 200, 216),
+                dirty_bg: egui::Color32::from_rgb(255, 243, 214),
+                dirty_text: egui::Color32::from_rgb(176, 102, 12),
+                saved_bg: egui::Color32::from_rgb(228, 248, 234),
+                saved_text: egui::Color32::from_rgb(24, 128, 56),
+                error_bg: egui::Color32::from_rgb(254, 232, 232),
+                error_text: egui::Color32::from_rgb(196, 42, 42),
+            }
         }
-    );
-    
-    // 绘制滑块
-    ui.painter().circle_filled(
-        egui::pos2(circle_x, rect.center().y),
-        radius - 4.0,
-        egui::Color32::WHITE
-    );
-    
-    response
-}
-
-pub fn common_input(
-    ui: &mut egui::Ui, 
-    title: &str,
-    text: &mut String,
-    hint: &str,
-    open_filter: bool,
-
-
-) -> bool{
-    ui.label(
-        egui::RichText::new(title)
-              .size(15.0)                               
-              .color(egui::Color32::from_rgb(0,0,0))  
-
-              
-    );
-    ui.add_space(8.0);
-    let input = egui::TextEdit::singleline( text)
-                .hint_text(hint)//提示
-                .desired_rows(1)//限制1行       
-                .min_size(egui::vec2(120.0, 35.0));
-                
-                
-    let response = ui.add(input);
-    if response.changed(){
-        if open_filter{
-            *text = text.chars()//过滤非法字符
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '@' || *c == '.' || *c == '-' || *c == '_')
-            .collect();
-        }
-        else{
-            *text = text.chars()//过滤非法字符
-            .collect();
-        };
-            
     }
-    response.changed()
-
-}
-pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
-    
-    ui.horizontal(|ui|{
-        ui.heading("设置");
-        ui.add_space(20.0);
-        let button = egui::Button::new(
-            egui::RichText::new("保存设置").size(15.0).color(egui::Color32::WHITE)
-            )
-              .min_size(egui::vec2(100.0,35.0))
-              .fill(egui::Color32::from_rgb(102,204,255))
-              .rounding(15.0);//圆角成度
-        let response = ui.add(button);
-        if response.clicked(){
-            match save_config(&mut app.config, Some(&app.push_config),Some(&app.custom_config), None){
-                Ok(_) => {
-                    log::info!("设置保存成功");
-                },
-                Err(e) => {
-                    log::info!("设置保存失败: {}", e);
-                }
-            }
-        }
-
-    })   ; 
-    
-    ui.separator();
-            //推送设置：
-    // 创建圆角长方形框架  
-    egui::Frame::none()
-        .fill(egui::Color32::from_rgb(245, 245, 250))  // 背景色
-        .rounding(12.0)  // 圆角半径
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 220)))  // 边框
-        .inner_margin(egui::Margin { left: 10.0, right: 20.0, top: 15.0, bottom: 15.0 })  // 内边距
-        .show(ui, |ui| {
-            
-        globle_setting(app,ui);
-        ui.separator();
-
-
-        });
-    egui::Frame::none()
-        .fill(egui::Color32::from_rgb(245, 245, 250))  // 背景色
-        .rounding(12.0)  // 圆角半径
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 220)))  // 边框
-        .inner_margin(egui::Margin { left: 10.0, right: 20.0, top: 15.0, bottom: 15.0 })  // 内边距
-        .show(ui, |ui| {
-            
-            push_setting(app,ui);  // 调用推送设置
-            ui.separator();
-
-        });
-
-        
-   
 }
 
-pub fn globle_setting(app: &mut Myapp, ui: &mut egui::Ui){
-    ui.horizontal(|ui| {
-        
-        common_input(ui, "请输入账号1预填手机号：", &mut app.custom_config.preinput_phone1, "请输入账号1绑定的手机号",true);
-        common_input(ui, "请输入账号2预填手机号：", &mut app.custom_config.preinput_phone2, "请输入账号2绑定的手机号，没有可不填",true);
-    });
-    ui.separator();
-    ui.horizontal(|ui|{
-        ui.label("请选择验证码识别方式：");
-         let options = ["本地识别", "ttocr识别", "选项3"];
-         
-        custom_selection_control(ui, &mut app.custom_config.captcha_mode, &options) ;
-        match app.custom_config.captcha_mode{
-            
-            1 => {
-                dynamic_caculate_space(ui, 300.0);
-                common_input(ui, "请输入ttocr key：", &mut app.custom_config.ttocr_key, "请输入ttocr key",true);
-                
-                
-            },
-            _ => {
-                
-            }
-        }
-
-    });
-    ui.separator();
-    ui.horizontal(|ui| {
-        on_switch(ui, "开启自定义UA", &mut app.custom_config.open_custom_ua);
-        dynamic_caculate_space(ui, 180.0);
-        common_input(ui, "", &mut app.custom_config.custom_ua, "请输入自定义UA",false);
-
-    });
-    
-    
-    
-    
-
+#[derive(Default, Clone, Copy)]
+struct FieldOutcome {
+    changed: bool,
+    lost_focus: bool,
 }
 
-fn custom_selection_control(ui: &mut egui::Ui, selected: &mut usize, options: &[&str]) -> bool {
+fn on_switch(
+    ui: &mut egui::Ui,
+    label: &str,
+    on: &mut bool,
+    palette: &SettingsPalette,
+) -> egui::Response {
     let mut changed = false;
+    let resp = ui
+        .horizontal(|ui| {
+            if !label.is_empty() {
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(14.5)
+                        .color(palette.text_primary)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+            }
+
+            let width = 46.0;
+            let height = 24.0;
+            let (rect, mut response) =
+                ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+
+            if response.clicked() {
+                *on = !*on;
+                response.mark_changed();
+                changed = true;
+            }
+
+            let animation_progress = ui.ctx().animate_bool(response.id, *on);
+            let radius = height * 0.5;
+            let circle_x = rect.left() + radius + animation_progress * (width - height);
+
+            ui.painter().rect_filled(
+                rect.expand(-1.0),
+                radius,
+                if *on {
+                    palette.accent
+                } else {
+                    palette.switch_off
+                },
+            );
+
+            ui.painter().circle_filled(
+                egui::pos2(circle_x, rect.center().y),
+                radius - 3.5,
+                egui::Color32::WHITE,
+            );
+
+            response
+        })
+        .inner;
+
+    let mut out = resp;
+    if changed {
+        out.mark_changed();
+    }
+    out
+}
+
+fn settings_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    subtitle: Option<&str>,
+    palette: &SettingsPalette,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::none()
+        .fill(palette.card_fill)
+        .rounding(12.0)
+        .stroke(egui::Stroke::new(1.0, palette.card_border))
+        .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width().max(260.0));
+            ui.label(
+                egui::RichText::new(title)
+                    .size(16.0)
+                    .strong()
+                    .color(palette.text_primary),
+            );
+            if let Some(sub) = subtitle {
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(sub)
+                            .size(12.0)
+                            .color(palette.text_hint),
+                    )
+                    .wrap(true),
+                );
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(10.0);
+            add_contents(ui);
+        });
+}
+
+fn grid_label(ui: &mut egui::Ui, text: &str, palette: &SettingsPalette) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(14.0)
+            .color(palette.text_primary),
+    );
+}
+
+fn text_input_row(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint: &str,
+    width: f32,
+    digits_only: bool,
+    ime_composing: bool,
+) -> FieldOutcome {
+    let response = ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            .desired_width(width)
+            .min_size(egui::vec2(width, 30.0)),
+    );
+    let lost_focus = response.lost_focus();
+    let mut changed = response.changed();
+    if digits_only && (changed || lost_focus) && (!ime_composing || lost_focus) {
+        let filtered: String = normalize_fullwidth_ascii(value)
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        if filtered != *value {
+            *value = filtered;
+            changed = true;
+        }
+    }
+    FieldOutcome {
+        changed,
+        lost_focus,
+    }
+}
+
+fn secret_input_row(
+    ui: &mut egui::Ui,
+    id_key: &str,
+    value: &mut String,
+    hint: &str,
+    width: f32,
+) -> FieldOutcome {
+    let state_id = egui::Id::new(id_key);
+    let mut visible = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(state_id).unwrap_or(false));
+
+    let mut outcome = FieldOutcome::default();
     ui.horizontal(|ui| {
+        let field_w = (width - 60.0).max(150.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(value)
+                .hint_text(hint)
+                .password(!visible)
+                .desired_width(field_w)
+                .min_size(egui::vec2(field_w, 30.0)),
+        );
+        outcome.changed = response.changed();
+        outcome.lost_focus = response.lost_focus();
+        let toggle_label = if visible { "隐藏" } else { "显示" };
+        if ui
+            .add(egui::Button::new(toggle_label).min_size(egui::vec2(50.0, 28.0)))
+            .clicked()
+        {
+            visible = !visible;
+            ui.ctx().data_mut(|d| d.insert_temp(state_id, visible));
+        }
+    });
+    outcome
+}
+
+fn custom_selection_control(
+    ui: &mut egui::Ui,
+    selected: &mut usize,
+    options: &[&str],
+    palette: &SettingsPalette,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
         for (idx, option) in options.iter().enumerate() {
             let is_selected = *selected == idx;
             let button = egui::Button::new(
                 egui::RichText::new(*option)
-                    .size(15.0)
-                    .color(if is_selected { egui::Color32::WHITE } else { egui::Color32::BLACK })
+                    .size(14.0)
+                    .color(if is_selected {
+                        egui::Color32::WHITE
+                    } else {
+                        palette.unselected_text
+                    }),
             )
-            .min_size(egui::vec2(80.0, 30.0))
-            .fill(if is_selected { 
-                egui::Color32::from_rgb(102, 204, 255) 
-            } else { 
-                egui::Color32::from_rgb(245, 245, 250)
+            .min_size(egui::vec2(96.0, 30.0))
+            .fill(if is_selected {
+                palette.accent
+            } else {
+                palette.unselected_fill
             })
-            .rounding(10.0);
-                
-            if ui.add(button).clicked() {
+            .stroke(egui::Stroke::new(
+                1.0,
+                if is_selected {
+                    palette.accent_border
+                } else {
+                    palette.unselected_border
+                },
+            ))
+            .rounding(7.0);
+
+            if ui.add(button).clicked() && *selected != idx {
                 *selected = idx;
                 changed = true;
             }
@@ -215,95 +293,709 @@ fn custom_selection_control(ui: &mut egui::Ui, selected: &mut usize, options: &[
     });
     changed
 }
-pub fn push_setting(app: &mut Myapp, ui: &mut egui::Ui){
-    //推送开关
-            
-            // 开关
-            ui.horizontal(|ui| {
-                
-                
-                on_switch(ui, "开启推送",&mut app.push_config.enabled);
-                let available = ui.available_width();
-                ui.add_space(available-100.0);
-                
-                let button = egui::Button::new(
-                    egui::RichText::new("测试推送").size(15.0).color(egui::Color32::WHITE)
-                    )
-                      .min_size(egui::vec2(100.0,40.0))
-                      .fill(egui::Color32::from_rgb(102,204,255))
-                      .rounding(15.0);//圆角成度
-                let response = ui.add(button);
-                if response.clicked(){
-                    app.push_config.push_all("biliticket推送测试", "这是一个推送测试", &None,&mut *app.task_manager);
-                }
-                  
 
-            });
-            if app.push_config.enabled{
-            ui.separator();
-            
+pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
+    let dark_mode = ui.ctx().style().visuals.dark_mode;
+    let palette = SettingsPalette::from_dark_mode(dark_mode);
+    let mut should_auto_save = false;
 
-            
-            
-            //推送设置
-            ui.horizontal(|ui|{
-                 
-                common_input(ui, "bark推送：",&mut app.push_config.bark_token,"请输入推送地址，只填token，token后可用?附加参数",false);
-                dynamic_caculate_space(ui, 180.0);
-                common_input(ui, "pushplus推送：",&mut app.push_config.pushplus_token,"请输入推送地址，只填token",true);
-                });
-                //TODO补充每个推送方式使用方法
-
-            ui.horizontal(|ui|{
-                 
-                common_input(ui, "方糖推送：",&mut app.push_config.fangtang_token,"请输入推送地址：SCTxxxxxxx",true);
-                dynamic_caculate_space(ui, 180.0);
-                common_input(ui, "钉钉机器人推送：",&mut app.push_config.dingtalk_token,"请输入钉钉机器人token，只填token",true);
-                });
-
-            ui.horizontal(|ui|{
-                common_input(ui, "企业微信推送：",&mut app.push_config.wechat_token,"请输入企业微信机器人token",true);
-                dynamic_caculate_space(ui, 180.0);
-
-                });
-            ui.horizontal(|ui|{
-                common_input(ui, "smtp服务器地址：",&mut app.push_config.smtp_config.smtp_server,"请输入smtp服务器地址",true);
-                dynamic_caculate_space(ui, 180.0);
-                common_input(ui, "smtp服务器端口：",&mut app.push_config.smtp_config.smtp_port,"请输入smtp服务器端口",true);
-                
-            });
-            ui.horizontal(|ui|{
-                
-                common_input(ui, "邮箱账号：",&mut app.push_config.smtp_config.smtp_username,"请输入发件人邮箱",true);
-                dynamic_caculate_space(ui, 180.0);
-                common_input(ui, "授权密码：",&mut app.push_config.smtp_config.smtp_password,"请输入授权密码",true);
-                dynamic_caculate_space(ui, 180.0);
-                
-            });
-            ui.horizontal(|ui|{
-                
-                
-                
-                common_input(ui, "发件人邮箱：",&mut app.push_config.smtp_config.smtp_from,"请输入发件人邮箱",true);
-                dynamic_caculate_space(ui, 180.0);
-                common_input(ui, "收件人邮箱：",&mut app.push_config.smtp_config.smtp_to,"请输入收件人邮箱",true);
-                
-            });
-            ui.horizontal(|ui| {
-                common_input(ui, "gotify地址：",&mut app.push_config.gotify_config.gotify_url,"请输入gotify服务器地址，只填写地址",false);
-                dynamic_caculate_space(ui, 180.0);
-                common_input(ui, "gotify的token", &mut app.push_config.gotify_config.gotify_token, "请输入gotify的token", true)
-            });
-        }
-        
-}
-pub fn dynamic_caculate_space(ui :&mut egui::Ui, next_obj_space: f32) {
-    let available_space = ui.available_width();
-    let mut space = available_space - next_obj_space - 250.0;
-    if space < 0.0 {
-        space = 0.0;
+    // 修正历史上可能保存的非法 captcha_mode（仅支持 0: 本地识别 / 1: ttocr识别）
+    if app.custom_config.captcha_mode >= 2 {
+        app.custom_config.captcha_mode = 0;
+        app.settings_dirty = true;
+        should_auto_save = true;
     }
-    ui.add_space(space);
+
+    // 顶部固定状态栏：标题 + 自动保存状态指示（输入框失焦/开关切换即自动保存，无需手动点击保存按钮）
+    let mut retry_save_clicked = false;
+    ui.horizontal(|ui| {
+        ui.heading(
+            egui::RichText::new("设置 / 微调")
+                .size(22.0)
+                .strong()
+                .color(palette.text_primary),
+        );
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(ref err_msg) = app.settings_save_error {
+                let retry_btn = egui::Button::new(
+                    egui::RichText::new("重试保存")
+                        .size(13.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .min_size(egui::vec2(82.0, 28.0))
+                .fill(palette.accent)
+                .rounding(7.0);
+                if ui.add(retry_btn).clicked() {
+                    retry_save_clicked = true;
+                }
+                ui.add_space(8.0);
+                egui::Frame::none()
+                    .fill(palette.error_bg)
+                    .rounding(7.0)
+                    .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("⚠ 自动保存失败")
+                                .size(12.5)
+                                .strong()
+                                .color(palette.error_text),
+                        )
+                        .on_hover_text(err_msg);
+                    });
+            } else if app.settings_dirty {
+                egui::Frame::none()
+                    .fill(palette.dirty_bg)
+                    .rounding(7.0)
+                    .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("✎ 编辑中 · 离开输入框后自动保存")
+                                .size(12.5)
+                                .strong()
+                                .color(palette.dirty_text),
+                        );
+                    });
+            } else if app.settings_last_saved_at.is_some() {
+                egui::Frame::none()
+                    .fill(palette.saved_bg)
+                    .rounding(7.0)
+                    .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("✓ 已自动保存并生效")
+                                .size(12.5)
+                                .strong()
+                                .color(palette.saved_text),
+                        );
+                    });
+            } else {
+                ui.label(
+                    egui::RichText::new("所有更改在离开输入框或切换开关后自动保存")
+                        .size(12.5)
+                        .color(palette.text_hint),
+                );
+            }
+        });
+    });
+
+    if retry_save_clicked {
+        should_auto_save = true;
+    }
+
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    // 整页内容放入垂直 ScrollArea，避免 600px 高度下裁切任何推送/SMTP/Gotify 配置
+    egui::ScrollArea::vertical()
+        .id_source("settings_tab_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let input_width = (ui.available_width() - 210.0).clamp(220.0, 520.0);
+
+            // 卡片 1：基础设置
+            settings_card(
+                ui,
+                "基础设置",
+                Some("预填手机号将在非实名制项目确认页及添加购票人时自动填充；所有设置离开输入框后自动保存并立即生效"),
+                &palette,
+                |ui| {
+                    render_global_settings(app, ui, input_width, &palette, &mut should_auto_save);
+                },
+            );
+
+            ui.add_space(12.0);
+
+            // 卡片 2：抢票参数微调
+            settings_card(
+                ui,
+                "抢票参数微调",
+                Some("控制捡漏轮询频率与下单重试节奏，合理配置可兼顾成功率与防风控"),
+                &palette,
+                |ui| {
+                    render_grab_tuning_settings(app, ui, &palette, &mut should_auto_save);
+                },
+            );
+
+            ui.add_space(12.0);
+
+            // 卡片 3：推送通知设置
+            settings_card(
+                ui,
+                "推送通知设置",
+                Some("抢票成功生成订单后将自动向所有已填写的渠道发送通知"),
+                &palette,
+                |ui| {
+                    render_push_settings(app, ui, input_width, &palette, &mut should_auto_save);
+                },
+            );
+
+            ui.add_space(16.0);
+        });
+
+    if should_auto_save && (app.settings_dirty || app.settings_save_error.is_some()) {
+        app.auto_save_settings();
+    }
 }
 
+fn render_global_settings(
+    app: &mut Myapp,
+    ui: &mut egui::Ui,
+    input_width: f32,
+    palette: &SettingsPalette,
+    should_auto_save: &mut bool,
+) {
+    let mut dirty = false;
+    let ime_composing = app.is_ime_composing();
 
+    egui::Grid::new("settings_global_grid")
+        .num_columns(2)
+        .spacing(egui::vec2(14.0, 10.0))
+        .min_col_width(145.0)
+        .show(ui, |ui| {
+            grid_label(ui, "账号 1 预填手机号：", palette);
+            let out = text_input_row(
+                ui,
+                &mut app.custom_config.preinput_phone1,
+                "仅输入数字（非实名制下单/添加购票人自动填充）",
+                input_width,
+                true,
+                ime_composing,
+            );
+            if out.changed {
+                dirty = true;
+            }
+            if out.lost_focus {
+                *should_auto_save = true;
+            }
+            ui.end_row();
+
+            grid_label(ui, "账号 2 预填手机号：", palette);
+            let out = text_input_row(
+                ui,
+                &mut app.custom_config.preinput_phone2,
+                "仅输入数字（可选，用于第 2 个账号自动填充）",
+                input_width,
+                true,
+                ime_composing,
+            );
+            if out.changed {
+                dirty = true;
+            }
+            if out.lost_focus {
+                *should_auto_save = true;
+            }
+            ui.end_row();
+
+            grid_label(ui, "验证码识别方式：", palette);
+            let options = ["本地识别", "ttocr识别"];
+            if custom_selection_control(
+                ui,
+                &mut app.custom_config.captcha_mode,
+                &options,
+                palette,
+            ) {
+                dirty = true;
+                *should_auto_save = true;
+            }
+            ui.end_row();
+
+            if app.custom_config.captcha_mode == 1 {
+                grid_label(ui, "ttocr AppKey：", palette);
+                let out = secret_input_row(
+                    ui,
+                    "settings_show_ttocr_key",
+                    &mut app.custom_config.ttocr_key,
+                    "请输入 ttocr 平台提供的 AppKey",
+                    input_width,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+            }
+
+            grid_label(ui, "自定义 User-Agent：", palette);
+            if on_switch(ui, "", &mut app.custom_config.open_custom_ua, palette).changed() {
+                dirty = true;
+                *should_auto_save = true;
+            }
+            ui.end_row();
+
+            grid_label(ui, "UA 内容：", palette);
+            ui.vertical(|ui| {
+                let out = text_input_row(
+                    ui,
+                    &mut app.custom_config.custom_ua,
+                    "开启上方开关后生效，留空则使用默认 UA",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                if !app.custom_config.open_custom_ua {
+                    ui.add_space(3.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("当前默认 UA：{}", app.base_default_ua))
+                                .size(11.5)
+                                .color(palette.text_hint),
+                        )
+                        .wrap(true),
+                    );
+                }
+            });
+            ui.end_row();
+        });
+
+    if dirty {
+        app.settings_dirty = true;
+    }
+}
+
+fn render_grab_tuning_settings(
+    app: &mut Myapp,
+    ui: &mut egui::Ui,
+    palette: &SettingsPalette,
+    should_auto_save: &mut bool,
+) {
+    let mut dirty = false;
+
+    egui::Grid::new("settings_tuning_grid")
+        .num_columns(2)
+        .spacing(egui::vec2(14.0, 10.0))
+        .min_col_width(145.0)
+        .show(ui, |ui| {
+            grid_label(ui, "捡漏轮询间隔：", palette);
+            ui.vertical(|ui| {
+                let resp = ui.add(
+                    egui::Slider::new(&mut app.custom_config.grab_interval_ms, 500..=10000)
+                        .step_by(100.0)
+                        .suffix(" ms"),
+                );
+                if resp.changed() {
+                    dirty = true;
+                }
+                if resp.drag_released() || resp.lost_focus() || (resp.changed() && !resp.dragged())
+                {
+                    *should_auto_save = true;
+                }
+                ui.label(
+                    egui::RichText::new("默认 2000 ms；过短的间隔更容易触发 B 站接口频控")
+                        .size(11.5)
+                        .color(palette.text_hint),
+                );
+            });
+            ui.end_row();
+
+            grid_label(ui, "下单最大重试次数：", palette);
+            ui.vertical(|ui| {
+                let resp = ui.add(
+                    egui::Slider::new(&mut app.custom_config.max_retry_count, 10..=200)
+                        .suffix(" 次"),
+                );
+                if resp.changed() {
+                    dirty = true;
+                }
+                if resp.drag_released() || resp.lost_focus() || (resp.changed() && !resp.dragged())
+                {
+                    *should_auto_save = true;
+                }
+                ui.label(
+                    egui::RichText::new("默认 60 次；单次抢票任务中遇到余票冲突时的最大重试上限")
+                        .size(11.5)
+                        .color(palette.text_hint),
+                );
+            });
+            ui.end_row();
+
+            grid_label(ui, "下单重试间隔：", palette);
+            ui.vertical(|ui| {
+                let resp = ui.add(
+                    egui::Slider::new(&mut app.custom_config.order_retry_delay_ms, 200..=3000)
+                        .step_by(50.0)
+                        .suffix(" ms"),
+                );
+                if resp.changed() {
+                    dirty = true;
+                }
+                if resp.drag_released() || resp.lost_focus() || (resp.changed() && !resp.dragged())
+                {
+                    *should_auto_save = true;
+                }
+                ui.label(
+                    egui::RichText::new("默认 400 ms；每次下单失败后等待多久再发起下一次重试")
+                        .size(11.5)
+                        .color(palette.text_hint),
+                );
+            });
+            ui.end_row();
+        });
+
+    ui.add_space(6.0);
+    if ui
+        .add(
+            egui::Button::new(
+                egui::RichText::new("恢复默认微调参数")
+                    .size(12.5)
+                    .color(palette.text_secondary),
+            )
+            .rounding(6.0),
+        )
+        .clicked()
+    {
+        app.custom_config.grab_interval_ms = 2000;
+        app.custom_config.max_retry_count = 60;
+        app.custom_config.order_retry_delay_ms = 400;
+        dirty = true;
+        *should_auto_save = true;
+    }
+
+    if dirty {
+        app.settings_dirty = true;
+    }
+}
+
+fn render_push_settings(
+    app: &mut Myapp,
+    ui: &mut egui::Ui,
+    input_width: f32,
+    palette: &SettingsPalette,
+    should_auto_save: &mut bool,
+) {
+    let mut dirty = false;
+    let mut send_test_push = false;
+    let ime_composing = app.is_ime_composing();
+
+    // 推送总开关 + 右对齐测试推送按钮（禁用时悬停提示）
+    ui.horizontal(|ui| {
+        if on_switch(ui, "开启推送", &mut app.push_config.enabled, palette).changed() {
+            dirty = true;
+            *should_auto_save = true;
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let test_btn = egui::Button::new(
+                egui::RichText::new("测试推送")
+                    .size(13.5)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .min_size(egui::vec2(94.0, 32.0))
+            .fill(palette.accent)
+            .rounding(8.0);
+
+            let resp = ui
+                .add_enabled(app.push_config.enabled, test_btn)
+                .on_hover_text("向所有已配置的推送渠道发送一条测试消息")
+                .on_disabled_hover_text("请先开启推送开关");
+            if resp.clicked() {
+                send_test_push = true;
+            }
+        });
+    });
+
+    if app.push_config.enabled {
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        ui.label(
+            egui::RichText::new("即时消息渠道")
+                .size(14.0)
+                .strong()
+                .color(palette.text_secondary),
+        );
+        ui.add_space(6.0);
+
+        egui::Grid::new("settings_push_channels_grid")
+            .num_columns(2)
+            .spacing(egui::vec2(14.0, 10.0))
+            .min_col_width(145.0)
+            .show(ui, |ui| {
+                grid_label(ui, "Bark 推送：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.bark_token,
+                    "填写设备 Key 或完整 URL，可在末尾用 ? 附加参数",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "PushPlus 推送：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.pushplus_token,
+                    "填写 PushPlus Token",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "方糖推送：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.fangtang_token,
+                    "填写 Server酱 SendKey（如 SCTxxxxxxx）",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "钉钉机器人：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.dingtalk_token,
+                    "填写钉钉机器人 Webhook 的 access_token",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "企业微信机器人：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.wechat_token,
+                    "填写企业微信机器人 Webhook 的 key",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "Gotify 地址：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.gotify_config.gotify_url,
+                    "填写服务器地址，如 https://gotify.example.com",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "Gotify Token：", palette);
+                let out = secret_input_row(
+                    ui,
+                    "settings_show_gotify_token",
+                    &mut app.push_config.gotify_config.gotify_token,
+                    "填写 Gotify 应用 Token",
+                    input_width,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        ui.label(
+            egui::RichText::new("SMTP 邮件通知")
+                .size(14.0)
+                .strong()
+                .color(palette.text_secondary),
+        );
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "支持 465 端口（隐式 TLS）与 587 端口（STARTTLS）；多个收件人可用英文逗号分隔",
+                )
+                .size(11.5)
+                .color(palette.text_hint),
+            )
+            .wrap(true),
+        );
+        ui.add_space(8.0);
+
+        egui::Grid::new("settings_smtp_grid")
+            .num_columns(2)
+            .spacing(egui::vec2(14.0, 10.0))
+            .min_col_width(145.0)
+            .show(ui, |ui| {
+                grid_label(ui, "SMTP 服务器地址：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.smtp_config.smtp_server,
+                    "如 smtp.qq.com 或 smtp.163.com",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "SMTP 端口：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.smtp_config.smtp_port,
+                    "仅数字，推荐 465（TLS）或 587（STARTTLS），留空默认 465",
+                    input_width,
+                    true,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "邮箱账号：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.smtp_config.smtp_username,
+                    "登录 SMTP 服务器使用的邮箱账号",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "授权密码：", palette);
+                let out = secret_input_row(
+                    ui,
+                    "settings_show_smtp_password",
+                    &mut app.push_config.smtp_config.smtp_password,
+                    "请输入邮箱 SMTP 授权码或密码",
+                    input_width,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "发件人邮箱：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.smtp_config.smtp_from,
+                    "发件人邮箱地址（留空默认与邮箱账号一致）",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+
+                grid_label(ui, "收件人邮箱：", palette);
+                let out = text_input_row(
+                    ui,
+                    &mut app.push_config.smtp_config.smtp_to,
+                    "接收通知的邮箱地址，多个地址可用逗号分隔",
+                    input_width,
+                    false,
+                    ime_composing,
+                );
+                if out.changed {
+                    dirty = true;
+                }
+                if out.lost_focus {
+                    *should_auto_save = true;
+                }
+                ui.end_row();
+            });
+    } else {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("开启上方开关后可配置 Bark、PushPlus、方糖、钉钉、企业微信、Gotify 及 SMTP 邮件通知。")
+                .size(12.5)
+                .color(palette.text_hint),
+        );
+    }
+
+    if dirty {
+        app.settings_dirty = true;
+    }
+
+    if send_test_push && app.push_config.enabled {
+        if *should_auto_save || app.settings_dirty {
+            app.auto_save_settings();
+            *should_auto_save = false;
+        }
+        app.task_manager.update_push_config(app.push_config.clone());
+        app.push_config.push_all(
+            "BiliTicket 推送测试",
+            "这是一条测试推送通知，收到此消息说明推送配置正常。",
+            &None,
+            &mut *app.task_manager,
+        );
+        app.show_info("正在发送测试推送...");
+    }
+}

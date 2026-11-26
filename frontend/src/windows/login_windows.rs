@@ -1,488 +1,688 @@
-use eframe::egui;
-use base64;
-use crate::app::Myapp;
-use common::{login::*, utility::CustomConfig};
+use std::time::Instant;
+
+use common::taskmanager::{
+    GenerateQrCodeRequest, LoginSmsRequest, SubmitLoginSmsRequest, TaskRequest,
+};
+use common::utils::MAX_ACCOUNTS;
+use eframe::egui::{self, Color32, Image, RichText, Stroke, TextureHandle};
 use image::Luma;
 use qrcode::QrCode;
-use egui::TextureHandle;
-use reqwest::Client;
-pub struct LoginTexture{
+
+use crate::app::{normalize_fullwidth_ascii, Myapp};
+
+pub struct LoginTexture {
     pub left_conrner_texture: Option<egui::TextureHandle>,
     pub right_conrner_texture: Option<egui::TextureHandle>,
 }
 
+const CORNER_LOAD_ATTEMPTED_KEY: &str = "login_corner_textures_attempted";
+
 pub fn show(app: &mut Myapp, ctx: &egui::Context) {
-    let mut login_method = &mut app.login_method.clone();
     let mut window_open = app.show_login_windows;
-    //save_texture = app.login
-    
-    // 如果图像还没加载，则加载它们
-    if !app.login_texture.left_conrner_texture.is_some() {
-        // 左下角图片的Base64字符串
-        let left_corner_base64 = get_left_base64(); 
-        
-        if let Some(texture) = load_image_from_base64(ctx, "left_corner", left_corner_base64) {
-            app.login_texture.left_conrner_texture = Some(texture);
-        }
+    if !window_open {
+        return;
     }
-    
-    if !app.login_texture.right_conrner_texture.is_some() {
-        // 右下角图片的Base64字符串
-        let right_corner_base64 = get_right_base64(); 
-        
-        if let Some(texture) = load_image_from_base64(ctx, "right_corner", right_corner_base64) {
-            app.login_texture.right_conrner_texture = Some(texture);
+
+    // 仅尝试解码一次装饰角标，避免解码失败时每帧重试
+    let attempted = ctx.memory(|mem| {
+        mem.data
+            .get_temp::<bool>(egui::Id::new(CORNER_LOAD_ATTEMPTED_KEY))
+            .unwrap_or(false)
+    });
+    if !attempted {
+        ctx.memory_mut(|mem| {
+            mem.data
+                .insert_temp(egui::Id::new(CORNER_LOAD_ATTEMPTED_KEY), true);
+        });
+        if app.login_texture.left_conrner_texture.is_none() {
+            app.login_texture.left_conrner_texture =
+                load_image_from_base64(ctx, "left_corner", get_left_base64());
+        }
+        if app.login_texture.right_conrner_texture.is_none() {
+            app.login_texture.right_conrner_texture =
+                load_image_from_base64(ctx, "right_corner", get_right_base64());
         }
     }
 
     egui::Window::new("登录窗口")
         .open(&mut window_open)
-        .default_size([700.0, 400.0])
-        .resizable(false)
+        .default_size([620.0, 440.0])
+        .resizable(true)
         .show(ctx, |ui| {
-            
-            ui.horizontal(|ui|{
-                ui.set_min_width(700.0);
-                
-                ui.vertical_centered(|ui|{
-                    ui.add_space(15.0);
-                    ui.horizontal(|ui|{
-                    ui.add_space(190.0);  //居中，我实在想不到其他好办法了，高度bug卡着
-                    if ui.link(egui::RichText::new("扫码登录").size(18.0)).clicked() {
-                        app.login_method = "扫码登录".to_string();
-                        
-                    }
-                    ui.add(egui::Label::new(egui::RichText::new("|").size(18.0)));
-                    if ui.link(egui::RichText::new("密码登录").size(18.0)).clicked() {
-                        app.login_method = String::from("密码登录");
-                        
-                    }
-                    ui.add(egui::Label::new(egui::RichText::new("|").size(18.0)));
-                    if ui.link(egui::RichText::new("短信登录").size(18.0)).clicked() {
-                        app.login_method = String::from("短信登录");
-                        
-                    }
-                    ui.add(egui::Label::new(egui::RichText::new("|").size(18.0)));
-                    if ui.link(egui::RichText::new("ck登录").size(18.0)).clicked() {
-                        app.login_method = String::from("ck登录");
-                        
-                    }
+            ui.set_min_size(egui::vec2(560.0, 380.0));
 
-                    
-                });
-                ui.vertical_centered(|ui|{
-                    
-
-                    match login_method .as_str(){
-                        "扫码登录" =>{
-                            ui.add_space(20.0);
-                            ui_qrcode_login(ui, app);
+            // 居中对称的登录方式切换栏（无硬编码偏移）
+            let tabs = [
+                ("扫码登录", "扫码登录"),
+                ("短信登录", "短信登录"),
+                ("Cookie登录", "ck登录"),
+                ("密码登录", "密码登录"),
+            ];
+            ui.columns(tabs.len(), |cols| {
+                for (i, (label, method_key)) in tabs.iter().enumerate() {
+                    cols[i].vertical_centered(|ui| {
+                        let is_selected = app.login_method == *method_key;
+                        let mut text = RichText::new(*label).size(16.0);
+                        if is_selected {
+                            text = text.strong().color(Color32::from_rgb(59, 130, 246));
                         }
-                        "密码登录" =>{
-                            ui.add_space(40.0);
-                            ui_password_login(ui, app);
+                        if ui.selectable_label(is_selected, text).clicked() {
+                            if app.login_method != *method_key {
+                                if *method_key != "扫码登录" {
+                                    stop_qr_login_tasks(app);
+                                }
+                                app.login_method = (*method_key).to_string();
+                            }
                         }
-                        "短信登录" =>{
-                            ui.add_space(40.0);
-                            ui_sms_login(ui, app);
-                        }
-                        "ck登录" =>{
-                            ui.add_space(40.0);
-                            ui_ck_login(ui, app);
-                        }
-                        _ => unreachable!(),
-                    }
-                });
-                //疑似控制高度的？勿动否则高度bug
-                ui.vertical(|ui|{
-                    ui.set_min_width(300.0);
-                    
-                });
-                ui.add_space(10.0);
-                
-
-                //控制窗口大小
-                //我也不知道是什么原因，只要竖直不addspace高度为300，窗口就会以最小显示，
-                //设置窗口最小尺寸也没有用
-                ui.add_space(200.0);
-                })
+                    });
+                }
             });
-            // 获取窗口大小和位置信息
-            let window_rect = ui.min_rect();
-            let scale_factor = 0.8; //缩放比例，按80%缩小
-            // 绘制左下角图片
-            if let Some(texture) =&app.login_texture.left_conrner_texture {
-                let image_size = texture.size_vec2();
-                let scaled_size = image_size * scale_factor;
-                let image_pos = egui::pos2(
-                    window_rect.min.x ,  // 左边距离窗口左边10像素
-                    window_rect.max.y - scaled_size.y   // 底部距离窗口底部10像素
-                );
+
+            ui.separator();
+            if app.account_manager.accounts.len() >= MAX_ACCOUNTS {
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(if ui.visuals().dark_mode {
+                        Color32::from_rgb(64, 48, 22)
+                    } else {
+                        Color32::from_rgb(255, 247, 230)
+                    })
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(217, 119, 6)))
+                    .rounding(6.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "🛡 当前已达防黄牛上限（最多 {} 个账号）：仅允许重新登录已有账号刷新凭证，新增其他账号将被拦截。",
+                                    MAX_ACCOUNTS
+                                ))
+                                .size(12.5)
+                                .color(if ui.visuals().dark_mode {
+                                    Color32::from_rgb(255, 206, 120)
+                                } else {
+                                    Color32::from_rgb(166, 90, 10)
+                                }),
+                            )
+                            .wrap(true),
+                        );
+                    });
+            }
+            ui.add_space(12.0);
+
+            // 直接按当前 login_method 映射到轻量 Copy 枚举，避免借用冲突与 unreachable!()
+            #[derive(Clone, Copy)]
+            enum LoginTab {
+                QrCode,
+                Sms,
+                Cookie,
+                Password,
+            }
+            let active_tab = match app.login_method.as_str() {
+                "扫码登录" => LoginTab::QrCode,
+                "短信登录" => LoginTab::Sms,
+                "ck登录" | "Cookie登录" => LoginTab::Cookie,
+                "密码登录" => LoginTab::Password,
+                _ => {
+                    app.login_method = "扫码登录".to_string();
+                    LoginTab::QrCode
+                }
+            };
+            match active_tab {
+                LoginTab::QrCode => ui_qrcode_login(ui, app),
+                LoginTab::Sms => ui_sms_login(ui, app),
+                LoginTab::Cookie => ui_ck_login(ui, app),
+                LoginTab::Password => ui_password_login(ui, app),
+            }
+
+            // 绘制左下/右下装饰图（保持在窗口底层边缘且不遮挡主操作区）
+            let window_rect = ui.max_rect();
+            let scale_factor = 0.55;
+            if let Some(texture) = &app.login_texture.left_conrner_texture {
+                let scaled_size = texture.size_vec2() * scale_factor;
+                let image_pos = egui::pos2(window_rect.min.x, window_rect.max.y - scaled_size.y);
                 let image_rect = egui::Rect::from_min_size(image_pos, scaled_size);
                 ui.painter().image(
-                    texture.id(), 
+                    texture.id(),
                     image_rect,
                     egui::Rect::from_min_max([0.0, 0.0].into(), [1.0, 1.0].into()),
-                    egui::Color32::WHITE
+                    Color32::from_white_alpha(200),
                 );
             }
-            
-            // 绘制右下角图片
             if let Some(texture) = &app.login_texture.right_conrner_texture {
-                let image_size = texture.size_vec2();
-                let scaled_size = image_size * scale_factor;
+                let scaled_size = texture.size_vec2() * scale_factor;
                 let image_pos = egui::pos2(
-                    window_rect.max.x - scaled_size.x ,  // 右边距离窗口右边10像素
-                    window_rect.max.y - scaled_size.y   // 底部距离窗口底部10像素
+                    window_rect.max.x - scaled_size.x,
+                    window_rect.max.y - scaled_size.y,
                 );
                 let image_rect = egui::Rect::from_min_size(image_pos, scaled_size);
                 ui.painter().image(
-                    texture.id(), 
+                    texture.id(),
                     image_rect,
                     egui::Rect::from_min_max([0.0, 0.0].into(), [1.0, 1.0].into()),
-                    egui::Color32::WHITE
+                    Color32::from_white_alpha(200),
                 );
             }
         });
 
-    app.show_login_windows = window_open;
+    if !window_open {
+        app.show_login_windows = false;
+        app.reset_login_state();
+    }
+}
+
+fn stop_qr_login_tasks(app: &mut Myapp) {
+    if let Some(task_id) = app.qrcode_polling_task_id.take() {
+        let _ = app.task_manager.cancel_task(&task_id);
+    }
+    app.login_qr_gen_task_id = None;
+    app.login_qr_requesting = false;
+    app.login_qrcode_url = None;
+    app.login_qr_texture_cache = None;
+    app.login_qr_error = None;
+    app.login_qr_status.clear();
+}
+
+fn trigger_qr_refresh(app: &mut Myapp) {
+    if let Some(task_id) = app.qrcode_polling_task_id.take() {
+        let _ = app.task_manager.cancel_task(&task_id);
+    }
+    app.login_qr_gen_task_id = None;
+    app.login_qrcode_url = None;
+    app.login_qr_texture_cache = None;
+    app.login_qr_error = None;
+
+    let req = TaskRequest::GenerateQrCodeRequest(GenerateQrCodeRequest {
+        client: app.client.clone(),
+    });
+    match app.task_manager.submit_task(req) {
+        Ok(task_id) => {
+            app.login_qr_gen_task_id = Some(task_id);
+            app.login_qr_requesting = true;
+            app.login_qr_status = "正在获取登录二维码...".to_string();
+        }
+        Err(e) => {
+            app.login_qr_gen_task_id = None;
+            app.login_qr_requesting = false;
+            app.login_qr_error = Some(format!("提交二维码生成任务失败: {}", e));
+            app.login_qr_status = "获取二维码失败".to_string();
+            log::error!("提交二维码生成任务失败: {}", e);
+        }
+    }
 }
 
 fn ui_qrcode_login(ui: &mut egui::Ui, app: &mut Myapp) {
-    let mut should_refresh = app.login_qrcode_url.is_none();
-    
-    //刷新按钮
-    let button = egui::Button::new(
-        egui::RichText::new("刷新二维码").size(15.0).color(egui::Color32::WHITE)
-        )
-          .min_size(egui::vec2(150.0,40.0))
-          .fill(egui::Color32::from_rgb(102,204,255))
-          .rounding(15.0);//圆角成度
-    let response = ui.add(button);
-    if response.clicked(){
-        //取消轮询任务
-        if let Some(task_id) = &app.qrcode_polling_task_id {
-            app.task_manager.cancel_task(task_id);
-            app.qrcode_polling_task_id = None;
-        }
-        should_refresh = true;
+    // 首次进入扫码 tab 自动异步申请二维码（无错误、未请求、未正在登录提交时）
+    if app.login_qrcode_url.is_none()
+        && !app.login_qr_requesting
+        && app.login_qr_error.is_none()
+        && !app.login_submitting
+    {
+        trigger_qr_refresh(app);
     }
-    
-    if should_refresh{
-    match common::login::qrcode_login(&app.client){
-        Ok(code) =>{
-            let login_string = format!("https://account.bilibili.com/h5/account-h5/auth/scan-web?navhide=1&callback=close&qrcode_key={}&from=main-fe-header",code);
-            if let Some(texture) = create_qrcode(ui.ctx(), &login_string) {
-            app.login_qrcode_url = Some(login_string.clone());
-            ui.vertical_centered(|ui|{
-                ui.add_space(10.0);
-                ui.image(&texture);
-            });
 
-            // 创建新的轮询任务
-            let qrcode_req = common::taskmanager::QrCodeLoginRequest {
-                qrcode_key: code,
-                qrcode_url: app.login_qrcode_url.clone().unwrap(),
-                user_agent: Some(app.custom_config.custom_ua.clone()),
+    ui.vertical_centered(|ui| {
+        let refresh_btn = egui::Button::new(
+            RichText::new("刷新二维码")
+                .size(14.5)
+                .color(Color32::WHITE),
+        )
+        .min_size(egui::vec2(140.0, 34.0))
+        .fill(Color32::from_rgb(59, 130, 246))
+        .rounding(10.0);
+
+        if ui
+            .add_enabled(
+                !app.login_qr_requesting && !app.login_submitting,
+                refresh_btn,
+            )
+            .clicked()
+        {
+            trigger_qr_refresh(app);
+        }
+
+        ui.add_space(12.0);
+
+        // 状态提示
+        if !app.login_qr_status.is_empty() {
+            ui.label(RichText::new(&app.login_qr_status).size(14.0));
+            ui.add_space(8.0);
+        }
+
+        // 错误态：内联展示 + 重试按钮，不触发离线无限重试循环
+        if let Some(err_msg) = app.login_qr_error.clone() {
+            egui::Frame::none()
+                .fill(if ui.visuals().dark_mode {
+                    Color32::from_rgb(60, 24, 24)
+                } else {
+                    Color32::from_rgb(254, 242, 242)
+                })
+                .stroke(Stroke::new(1.0, Color32::from_rgb(220, 68, 55)))
+                .rounding(8.0)
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(err_msg).color(Color32::from_rgb(220, 68, 55)),
+                        )
+                        .wrap(true),
+                    );
+                    ui.add_space(8.0);
+                    if ui.button("重试").clicked() {
+                        trigger_qr_refresh(app);
+                    }
+                });
+            return;
+        }
+
+        // 请求二维码或扫码确认后拉取账号中
+        if app.login_qr_requesting || app.login_submitting {
+            ui.add_space(28.0);
+            ui.spinner();
+            ui.add_space(10.0);
+            let wait_text = if app.login_submitting {
+                "正在验证登录并获取账号信息..."
+            } else {
+                "正在获取登录二维码..."
             };
-            
-            // 提交任务到任务管理器
-            let request = common::taskmanager::TaskRequest::QrCodeLoginRequest(qrcode_req);
-            match app.task_manager.submit_task(request) {
-                Ok(task_id) => {
-                    app.qrcode_polling_task_id = Some(task_id);
-                    log::info!("开始轮询二维码登录状态...");
-                },
-                Err(e) => {
-                    log::error!("提交二维码轮询任务失败: {}", e);
+            ui.label(wait_text);
+            return;
+        }
+
+        // 使用纹理缓存渲染二维码（仅在 URL 变化时编码一次）
+        if let Some(qr_url) = app.login_qrcode_url.clone() {
+            let cache_hit = app
+                .login_qr_texture_cache
+                .as_ref()
+                .map(|(cached_url, _)| cached_url == &qr_url)
+                .unwrap_or(false);
+
+            if !cache_hit {
+                match create_qrcode_safe(ui.ctx(), "login_qrcode", &qr_url) {
+                    Ok(tex) => {
+                        app.login_qr_texture_cache = Some((qr_url, tex));
+                    }
+                    Err(e) => {
+                        app.login_qr_error = Some(e);
+                        app.login_qr_texture_cache = None;
+                    }
                 }
             }
 
-        }}
-        Err(e) => {
-            eprintln!("获取二维码失败，原因: {}", e);
-            return;
+            if let Some((_, ref texture)) = app.login_qr_texture_cache {
+                egui::Frame::none()
+                    .fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, Color32::from_gray(200)))
+                    .rounding(8.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.add(Image::new(texture).fit_to_exact_size(egui::vec2(200.0, 200.0)));
+                    });
+            }
         }
-        
-    }}
-    else{
-        if let Some(texture) = create_qrcode(ui.ctx(), &app.login_qrcode_url.as_ref().unwrap()) {
-
-            ui.vertical_centered(|ui|{
-                ui.add_space(20.0);
-                ui.image(&texture);
     });
-}}
 }
 
 fn ui_password_login(ui: &mut egui::Ui, app: &mut Myapp) {
-    
-    
-    ui.vertical_centered(|ui|{
-        common_input(ui, "账号", &mut app.login_input.account, "请输入账号", true);
-        ui.add_space(10.0);
-        common_input(ui, "密码", &mut app.login_input.password, "请输入密码", true);
-        ui.add_space(20.0);
-        let button = egui::Button::new(
-            egui::RichText::new("登录").size(15.0).color(egui::Color32::WHITE)
-            )
-              .min_size(egui::vec2(200.0,40.0))
-              .fill(egui::Color32::from_rgb(0,174,236))
-              .rounding(15.0);//圆角成度
-        let response = ui.add(button);
-        if response.clicked(){
-            match password_login(&app.login_input.account, &app.login_input.password){
-                Ok(log) => {
-                    log::info!("{}", log);
-                }
-                Err(e) => {
-                    log::error!("密码登录时出错！请尝试使用其他登陆方式{}", e);
-                    
-                }
-            }
-        }
-        
-        
-
+    ui.vertical_centered(|ui| {
+        ui.add_space(18.0);
+        egui::Frame::none()
+            .fill(if ui.visuals().dark_mode {
+                Color32::from_rgb(36, 40, 48)
+            } else {
+                Color32::from_rgb(245, 247, 252)
+            })
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .rounding(8.0)
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(RichText::new("暂不支持账号密码直接登录").size(16.0).strong());
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        "由于哔哩哔哩 Web 端安全策略，账号密码登录暂不可用。为保护账号安全，请改用以下任一官方登录方式：",
+                    )
+                    .wrap(true),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.button("扫码登录（推荐）").clicked() {
+                        app.login_method = "扫码登录".to_string();
+                    }
+                    if ui.button("短信验证码登录").clicked() {
+                        app.login_method = "短信登录".to_string();
+                    }
+                    if ui.button("Cookie 登录").clicked() {
+                        app.login_method = "ck登录".to_string();
+                    }
+                });
+            });
     });
 }
 
 fn ui_sms_login(ui: &mut egui::Ui, app: &mut Myapp) {
-    
-    
-    ui.vertical_centered(|ui|{
-        //phone的要传入app，参数从里面获得
-        phone_input(ui, "手机号", app, "请输入手机号", true);
-        app.show_log_window = true;
-        ui.add_space(10.0);
-        common_input(ui, "验证码", &mut app.login_input.sms_code, "请输入验证码", true);
-        ui.add_space(20.0);
-        let button = egui::Button::new(
-            egui::RichText::new("登录").size(15.0).color(egui::Color32::WHITE)
-            )
-              .min_size(egui::vec2(200.0,40.0))
-              .fill(egui::Color32::from_rgb(0,174,236))
-              .rounding(15.0);//圆角成度
-        let response = ui.add(button);
-        if response.clicked(){
-            let request = common::taskmanager::SubmitLoginSmsRequest{
-                phone: app.login_input.phone.clone(),
-                code: app.login_input.sms_code.clone(),
-                captcha_key: app.sms_captcha_key.clone(),
+    let cooldown_secs = app.sms_cooldown_until.and_then(|until| {
+        let now = Instant::now();
+        if until > now {
+            Some((until - now).as_secs() + 1)
+        } else {
+            None
+        }
+    });
+    if cooldown_secs.is_none() {
+        app.sms_cooldown_until = None;
+    }
+
+    let mut send_sms_clicked = false;
+    let mut submit_sms_clicked = false;
+    let ime_composing = app.is_ime_composing();
+
+    ui.vertical_centered(|ui| {
+        ui.add_space(8.0);
+
+        egui::Grid::new("sms_login_form_grid")
+            .num_columns(2)
+            .spacing([12.0, 14.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("手机号:").size(15.0));
+                ui.horizontal(|ui| {
+                    let phone_resp = ui.add(
+                        egui::TextEdit::singleline(&mut app.login_input.phone)
+                            .hint_text("请输入 11 位手机号")
+                            .desired_width(180.0),
+                    );
+                    if (phone_resp.changed() || phone_resp.lost_focus())
+                        && (!ime_composing || phone_resp.lost_focus())
+                    {
+                        app.login_input.phone = normalize_fullwidth_ascii(&app.login_input.phone)
+                            .chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .take(15)
+                            .collect();
+                    }
+
+                    let sms_btn_label = if app.sms_sending {
+                        "发送中...".to_string()
+                    } else if let Some(secs) = cooldown_secs {
+                        format!("{}s 后重试", secs)
+                    } else {
+                        "获取验证码".to_string()
+                    };
+                    let can_send =
+                        !app.sms_sending && cooldown_secs.is_none() && !app.login_submitting;
+                    if ui
+                        .add_enabled(can_send, egui::Button::new(sms_btn_label))
+                        .clicked()
+                    {
+                        send_sms_clicked = true;
+                    }
+                });
+                ui.end_row();
+
+                ui.label(RichText::new("验证码:").size(15.0));
+                let code_resp = ui.add(
+                    egui::TextEdit::singleline(&mut app.login_input.sms_code)
+                        .hint_text("请输入短信验证码")
+                        .desired_width(180.0),
+                );
+                if (code_resp.changed() || code_resp.lost_focus())
+                    && (!ime_composing || code_resp.lost_focus())
+                {
+                    app.login_input.sms_code = normalize_fullwidth_ascii(&app.login_input.sms_code)
+                        .chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .take(8)
+                        .collect();
+                }
+                ui.end_row();
+            });
+
+        if app.sms_captcha_key.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("请先输入手机号并点击「获取验证码」")
+                    .size(12.5)
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+
+        ui.add_space(16.0);
+
+        let login_label = if app.login_submitting {
+            "登录中..."
+        } else {
+            "登录"
+        };
+        let login_btn = egui::Button::new(
+            RichText::new(login_label).size(15.0).color(Color32::WHITE),
+        )
+        .min_size(egui::vec2(180.0, 38.0))
+        .fill(Color32::from_rgb(0, 174, 236))
+        .rounding(12.0);
+
+        if ui
+            .add_enabled(!app.login_submitting && !app.sms_sending, login_btn)
+            .clicked()
+        {
+            submit_sms_clicked = true;
+        }
+    });
+
+    if send_sms_clicked {
+        let phone: String = normalize_fullwidth_ascii(&app.login_input.phone)
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(15)
+            .collect();
+        app.login_input.phone = phone.clone();
+        if !is_valid_sms_phone(&phone) {
+            app.show_error("请输入有效的数字手机号（11 位手机号）");
+        } else {
+            app.sms_sending = true;
+            let sms_req = LoginSmsRequest {
+                phone,
                 client: app.client.clone(),
+                custom_config: app.custom_config.clone(),
+                local_captcha: app.local_captcha.clone(),
             };
-            let request = common::taskmanager::TaskRequest::SubmitLoginSmsRequest(request);
-            match app.task_manager.submit_task(request) {
-                Ok(task_id) => {
-                    app.pending_sms_task_id = Some(task_id);
-                    log::info!("短信验证码登录中...");
-                },
+            match app
+                .task_manager
+                .submit_task(TaskRequest::LoginSmsRequest(sms_req))
+            {
+                Ok(_) => {
+                    log::info!("短信验证码发送中...");
+                }
                 Err(e) => {
-                    log::error!("提交短信登录任务失败: {}", e);
+                    app.sms_sending = false;
+                    log::error!("提交短信任务失败: {}", e);
+                    app.show_error(format!("提交短信任务失败: {}", e));
                 }
             }
         }
-
-    });
-}
-
-fn ui_ck_login(ui: &mut egui::Ui  , app: &mut Myapp)  {
-    
-    ui.vertical_centered(|ui|{
-        common_input(ui, "请输入ck", &mut app.login_input.cookie, "请输入ck，不知道不要填写", 
-        false); 
-
-        ui.add_space(20.0);
-        let button = egui::Button::new(
-            egui::RichText::new("登录").size(15.0).color(egui::Color32::WHITE)
-            )
-              .min_size(egui::vec2(200.0,40.0))
-              .fill(egui::Color32::from_rgb(0,174,236))
-              .rounding(15.0);//圆角成度
-        let response = ui.add(button);
-        if response.clicked(){
-            app.cookie_login = Some(app.login_input.cookie.clone());
-        }
-    });
-
-    
-    
-   
-}
-
-pub fn common_input(
-    ui: &mut egui::Ui, 
-    title: &str,
-    text: &mut String,
-    hint: &str,
-    open_filter: bool,
-
-
-) -> bool{
-    ui.label(
-        egui::RichText::new(title)
-              .size(15.0)                               
-              .color(egui::Color32::from_rgb(0,0,0))  
-
-              
-    );
-    ui.add_space(8.0);
-    let input = egui::TextEdit::singleline( text)
-                .hint_text(hint)//提示
-                .desired_rows(1)//限制1行       
-                .min_size(egui::vec2(120.0, 35.0));
-                
-                
-    let response = ui.add(input);
-    if response.changed(){
-        if open_filter{
-            *text = text.chars()//过滤非法字符
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '@' || *c == '.' || *c == '-' || *c == '_')
-            .collect();
-        }
-        else{
-            *text = text.chars()//过滤非法字符
-            .collect();
-        };
-            
     }
-    response.changed()
 
-}
-
-pub fn phone_input(
-    ui: &mut egui::Ui, 
-    title: &str,
-    app: &mut Myapp,
-    hint: &str,
-    open_filter: bool,
-   
-    
-
-) -> bool{
-    let ua = &app.default_ua;
-    let local_captcha = app.local_captcha.clone();
-    let custom_config = app.custom_config.clone();
-    let client = 
-    ui.label(
-        egui::RichText::new(title)
-              .size(15.0)                               
-              .color(egui::Color32::from_rgb(0,0,0))  
-
-              
-    );
-    ui.add_space(8.0);
-    let input = egui::TextEdit::singleline(&mut app.login_input.phone)
-                .hint_text(hint)//提示
-                .desired_rows(1)//限制1行       
-                .min_size(egui::vec2(120.0, 25.0));
-                
-             
-    let response = ui.add(input);
-    if response.changed(){
-        if open_filter{
-            app.login_input.phone = app.login_input.phone.chars()//过滤非法字符
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '@' || *c == '.' || *c == '-' || *c == '_')
+    if submit_sms_clicked {
+        let phone: String = normalize_fullwidth_ascii(&app.login_input.phone)
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(15)
             .collect();
-        }
-        else{
-            app.login_input.phone = app.login_input.phone.chars()//过滤非法字符
+        let code: String = normalize_fullwidth_ascii(&app.login_input.sms_code)
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(8)
             .collect();
-        };
-            
-    }
-    if ui.link(egui::RichText::new("发送短信").size(12.0)).clicked() {
-        log::info!("{}", app.login_input.phone);
-        let sms_req = common::taskmanager::LoginSmsRequest {
-            phone: app.login_input.phone.clone(),
-            client: app.client.clone(),
-            custom_config: custom_config.clone(),
-            local_captcha: local_captcha.clone(),
-        };  
-        let request = common::taskmanager::TaskRequest::LoginSmsRequest(sms_req);
-        match app.task_manager.submit_task(request) {
-            Ok(task_id) => {
-                app.pending_sms_task_id = Some(task_id);
-                log::info!("短信验证码发送中...");
-                //app.show_toast("短信发送中", "请稍候", 3.0);
-            },
-            Err(e) => {
-                log::error!("提交短信任务失败: {}", e);
-                //app.show_toast("发送失败", &format!("错误: {}", e), 3.0);
+        app.login_input.phone = phone.clone();
+        app.login_input.sms_code = code.clone();
+        let captcha_key = app.sms_captcha_key.trim().to_string();
+
+        if !is_valid_sms_phone(&phone) {
+            app.show_error("请输入有效的数字手机号");
+        } else if captcha_key.is_empty() {
+            app.show_error("请先获取短信验证码后再登录");
+        } else if code.len() < 4 || !code.bytes().all(|b| b.is_ascii_digit()) {
+            app.show_error("请输入有效的数字短信验证码");
+        } else {
+            app.login_submitting = true;
+            let req = SubmitLoginSmsRequest {
+                phone,
+                code,
+                captcha_key,
+                client: app.client.clone(),
+            };
+            match app
+                .task_manager
+                .submit_task(TaskRequest::SubmitLoginSmsRequest(req))
+            {
+                Ok(_) => {
+                    log::info!("短信验证码登录中...");
+                }
+                Err(e) => {
+                    app.login_submitting = false;
+                    log::error!("提交短信登录任务失败: {}", e);
+                    app.show_error(format!("提交短信登录任务失败: {}", e));
+                }
             }
         }
-       
-                    
-                }   
-    response.changed()
-
+    }
 }
-/// 生成二维码
-pub fn create_qrcode(ctx: &egui::Context, content: &str) -> Option<TextureHandle> {
-    // 创建二维码
-    let qr_bcode = QrCode::new(content.as_bytes()).unwrap();
-    let qr_image = qr_bcode.render::<Luma<u8>>().build();
 
-    // 将图像转换为ColorImage
+fn ui_ck_login(ui: &mut egui::Ui, app: &mut Myapp) {
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new("粘贴 B站完整 Cookie").size(15.0).strong());
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical()
+            .id_source("cookie_login_input_scroll")
+            .max_height(120.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut app.login_input.cookie)
+                        .hint_text("请粘贴完整 Cookie（需包含 SESSDATA、bili_jct 等字段）")
+                        .desired_rows(4)
+                        .desired_width(440.0),
+                );
+            });
+
+        ui.add_space(16.0);
+
+        let btn_label = if app.login_submitting {
+            "验证登录中..."
+        } else {
+            "登录"
+        };
+        let button = egui::Button::new(RichText::new(btn_label).size(15.0).color(Color32::WHITE))
+            .min_size(egui::vec2(180.0, 38.0))
+            .fill(Color32::from_rgb(0, 174, 236))
+            .rounding(12.0);
+
+        if ui.add_enabled(!app.login_submitting, button).clicked() {
+            let trimmed = app.login_input.cookie.trim().to_string();
+            if trimmed.is_empty() {
+                app.show_error("Cookie 不能为空，请粘贴有效 Cookie");
+            } else {
+                app.login_submitting = true;
+                app.cookie_login = Some(trimmed);
+            }
+        }
+    });
+}
+
+fn is_valid_sms_phone(phone: &str) -> bool {
+    (7..=15).contains(&phone.len()) && phone.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 将内容编码为二维码 ColorImage（无 panic，可供离线单元测试直接验证）
+pub(crate) fn render_qrcode_color_image(content: &str) -> Result<egui::ColorImage, String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("二维码内容不能为空".to_string());
+    }
+
+    let qr_code =
+        QrCode::new(trimmed.as_bytes()).map_err(|e| format!("生成二维码失败: {}", e))?;
+    let qr_image = qr_code.render::<Luma<u8>>().build();
+
     let width = qr_image.width() as usize;
     let height = qr_image.height() as usize;
-    let mut color_image = egui::ColorImage::new([width, height], egui::Color32::WHITE);
-    
-    // 复制像素数据
+    let mut color_image = egui::ColorImage::new([width, height], Color32::WHITE);
+
     for y in 0..height {
         for x in 0..width {
             let pixel = qr_image.get_pixel(x as u32, y as u32);
-            
-            let color = if pixel[0] == 0 {
-                egui::Color32::BLACK
+            color_image.pixels[y * width + x] = if pixel[0] == 0 {
+                Color32::BLACK
             } else {
-                egui::Color32::WHITE
+                Color32::WHITE
             };
-            color_image.pixels[y * width + x] = color;
         }
     }
-    
-    Some(ctx.load_texture(
-        "qrcode",
-        color_image,
-        egui::TextureOptions::default()
-    ))
-} 
 
-// Base64图像加载函数
-fn load_image_from_base64(ctx: &egui::Context, name: &str, base64_data: &str) -> Option<egui::TextureHandle> {
-    // 尝试解码Base64字符串
+    Ok(color_image)
+}
+
+/// 安全生成二维码纹理（不 panic，使用 NEAREST 采样保持缩放清晰）
+pub fn create_qrcode_safe(
+    ctx: &egui::Context,
+    texture_name: &str,
+    content: &str,
+) -> Result<TextureHandle, String> {
+    let color_image = render_qrcode_color_image(content)?;
+    Ok(ctx.load_texture(
+        texture_name,
+        color_image,
+        egui::TextureOptions::NEAREST,
+    ))
+}
+
+fn load_image_from_base64(
+    ctx: &egui::Context,
+    name: &str,
+    base64_data: &str,
+) -> Option<egui::TextureHandle> {
     let base64_decoded = match base64::decode(base64_data) {
         Ok(data) => data,
         Err(err) => {
-            eprintln!("Failed to decode base64 image: {}", err);
+            log::warn!("解码内置装饰图失败 ({}): {}", name, err);
             return None;
         }
     };
 
-    // 创建图像对象
     let image = match image::load_from_memory(&base64_decoded) {
         Ok(img) => img,
         Err(err) => {
-            eprintln!("Failed to load image from memory: {}", err);
+            log::warn!("加载内置装饰图失败 ({}): {}", name, err);
             return None;
         }
     };
 
-    // 将图像转换为RGBA格式
     let image_buffer = image.to_rgba8();
     let size = [image_buffer.width() as _, image_buffer.height() as _];
     let pixels = image_buffer.into_vec();
-
-    // 创建egui颜色图像
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
 
-    // 创建并返回纹理句柄
-    Some(ctx.load_texture(
-        name,
-        color_image,
-        egui::TextureOptions::default()
-    ))
+    Some(ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_qrcode_color_image;
+
+    #[test]
+    fn qrcode_rendering_succeeds_for_url_and_fails_gracefully_for_empty_or_oversized() {
+        let ok_img = render_qrcode_color_image("https://passport.bilibili.com/h5-app/passport/login/scan?qrcode_key=test123")
+            .expect("valid URL should encode to QR image");
+        assert!(ok_img.size[0] > 0 && ok_img.size[1] > 0);
+        assert_eq!(ok_img.pixels.len(), ok_img.size[0] * ok_img.size[1]);
+
+        assert!(render_qrcode_color_image("").is_err());
+        assert!(render_qrcode_color_image("   ").is_err());
+
+        // 超出 QR 最大容量的内容应返回 Err 而绝不 panic
+        let oversized = "A".repeat(10_000);
+        assert!(render_qrcode_color_image(&oversized).is_err());
+    }
 }
 
 fn get_left_base64() -> &'static str{

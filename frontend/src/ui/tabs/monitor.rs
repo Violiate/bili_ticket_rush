@@ -1,6 +1,67 @@
 use eframe::egui;
+
 use crate::app::Myapp;
 use common::taskmanager::TaskStatus;
+
+struct MonitorPalette {
+    card_fill: egui::Color32,
+    card_border: egui::Color32,
+    text_primary: egui::Color32,
+    text_secondary: egui::Color32,
+    text_muted: egui::Color32,
+    notice_fill: egui::Color32,
+    notice_border: egui::Color32,
+    notice_text: egui::Color32,
+    slate: egui::Color32,
+    pink: egui::Color32,
+    cancel: egui::Color32,
+    cancelling: egui::Color32,
+    success: egui::Color32,
+    cancelled_gray: egui::Color32,
+    failed_red: egui::Color32,
+}
+
+impl MonitorPalette {
+    fn from_dark_mode(dark_mode: bool) -> Self {
+        if dark_mode {
+            Self {
+                card_fill: egui::Color32::from_rgb(36, 38, 46),
+                card_border: egui::Color32::from_rgb(62, 66, 80),
+                text_primary: egui::Color32::from_rgb(235, 238, 245),
+                text_secondary: egui::Color32::from_rgb(180, 186, 202),
+                text_muted: egui::Color32::from_rgb(138, 144, 160),
+                notice_fill: egui::Color32::from_rgb(52, 44, 32),
+                notice_border: egui::Color32::from_rgb(156, 108, 48),
+                notice_text: egui::Color32::from_rgb(255, 192, 122),
+                slate: egui::Color32::from_rgb(86, 98, 122),
+                pink: egui::Color32::from_rgb(251, 114, 153),
+                cancel: egui::Color32::from_rgb(224, 76, 76),
+                cancelling: egui::Color32::from_rgb(236, 154, 32),
+                success: egui::Color32::from_rgb(46, 160, 67),
+                cancelled_gray: egui::Color32::from_rgb(112, 120, 136),
+                failed_red: egui::Color32::from_rgb(220, 72, 68),
+            }
+        } else {
+            Self {
+                card_fill: egui::Color32::from_rgb(248, 249, 252),
+                card_border: egui::Color32::from_rgb(218, 222, 234),
+                text_primary: egui::Color32::from_rgb(40, 44, 58),
+                text_secondary: egui::Color32::from_rgb(92, 98, 114),
+                text_muted: egui::Color32::from_rgb(132, 138, 154),
+                notice_fill: egui::Color32::from_rgb(255, 247, 235),
+                notice_border: egui::Color32::from_rgb(240, 188, 128),
+                notice_text: egui::Color32::from_rgb(188, 86, 22),
+                slate: egui::Color32::from_rgb(92, 104, 128),
+                pink: egui::Color32::from_rgb(251, 114, 153),
+                cancel: egui::Color32::from_rgb(228, 80, 80),
+                cancelling: egui::Color32::from_rgb(240, 158, 32),
+                success: egui::Color32::from_rgb(46, 160, 67),
+                cancelled_gray: egui::Color32::from_rgb(122, 130, 146),
+                failed_red: egui::Color32::from_rgb(216, 66, 62),
+            }
+        }
+    }
+}
 
 fn grab_mode_label(mode: u8) -> &'static str {
     match mode {
@@ -11,17 +72,27 @@ fn grab_mode_label(mode: u8) -> &'static str {
     }
 }
 
-/// 不同抢票模式对应的标签底色
 fn mode_color(mode: u8) -> egui::Color32 {
     match mode {
-        0 => egui::Color32::from_rgb(64, 150, 238),  // 定时 - 蓝
-        1 => egui::Color32::from_rgb(76, 175, 80),   // 直接 - 绿
-        2 => egui::Color32::from_rgb(255, 145, 77),  // 捡漏 - 橙
-        _ => egui::Color32::from_rgb(150, 150, 160),
+        0 => egui::Color32::from_rgb(64, 150, 238), // 定时 - 蓝
+        1 => egui::Color32::from_rgb(66, 168, 78),  // 直接 - 绿
+        2 => egui::Color32::from_rgb(242, 138, 62), // 捡漏 - 橙
+        _ => egui::Color32::from_rgb(136, 140, 152),
     }
 }
 
-/// 小圆角标签（彩色底 + 白字）
+/// 格式化运行时长：不足 1 小时为 MM:SS，满 1 小时为 HH:MM:SS
+pub(crate) fn format_elapsed(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem_secs = secs % 60;
+    if hours > 0 {
+        format!("{:02}:{:02}:{:02}", hours, mins, rem_secs)
+    } else {
+        format!("{:02}:{:02}", mins, rem_secs)
+    }
+}
+
 fn badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32) {
     egui::Frame::none()
         .fill(fill)
@@ -31,148 +102,438 @@ fn badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32) {
             ui.label(
                 egui::RichText::new(text)
                     .color(egui::Color32::WHITE)
-                    .size(12.5)
+                    .size(12.0)
                     .strong(),
             );
         });
 }
 
-pub fn render(app: &mut Myapp, ui: &mut egui::Ui){
+pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
+    let dark_mode = ui.ctx().style().visuals.dark_mode;
+    let palette = MonitorPalette::from_dark_mode(dark_mode);
 
-    // 配色（卡片为暗色主题上的亮色岛屿，与 account 标签页风格一致）
-    let c_dark = egui::Color32::from_rgb(55, 58, 74);
-    let c_gray = egui::Color32::from_rgb(120, 124, 140);
-    let c_weak = egui::Color32::from_rgb(150, 154, 170);
-    let c_card = egui::Color32::from_rgb(247, 248, 251);
-    let c_border = egui::Color32::from_rgb(228, 230, 240);
-    let c_slate = egui::Color32::from_rgb(99, 108, 130);
-    let c_pink = egui::Color32::from_rgb(251, 114, 153);
-    let c_cancel = egui::Color32::from_rgb(235, 87, 87);
-    let c_cancelling = egui::Color32::from_rgb(245, 166, 35);
-
-    if let Some(accounce) = app.announce3.clone() {
-        ui.label(accounce);
-    } else {
-        ui.label("无法连接服务器");
-    }
-
-    ui.separator();
-    ui.add_space(4.0);
-
-    // 运行中任务列表（自日志窗口迁移至此监视面板）
     let running_tasks = app.task_manager.list_running_tasks();
+    let recent_tasks = app.task_manager.list_recent_tasks();
 
-    // 区块标题 + 数量徽标
+    // 顶部栏：标题 + 状态概览 + 实时日志窗口快捷按钮
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("🎫 运行中任务").size(17.0).strong());
-        ui.add_space(6.0);
-        badge(ui, &running_tasks.len().to_string(), c_pink);
+        ui.heading(
+            egui::RichText::new("监视面板")
+                .size(22.0)
+                .strong()
+                .color(palette.text_primary),
+        );
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "运行中 {} · 近期记录 {}",
+                running_tasks.len(),
+                recent_tasks.len()
+            ))
+            .size(13.0)
+            .color(palette.text_secondary),
+        );
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let log_btn_text = if app.show_log_window { "隐藏日志" } else { "查看日志" };
+            let log_btn_text = if app.show_log_window {
+                "隐藏实时日志窗口"
+            } else {
+                "打开实时日志窗口"
+            };
             let log_btn = egui::Button::new(
-                egui::RichText::new(log_btn_text).color(egui::Color32::WHITE).size(13.0),
+                egui::RichText::new(log_btn_text)
+                    .color(egui::Color32::WHITE)
+                    .size(13.0),
             )
-            .fill(c_slate)
+            .fill(palette.slate)
             .rounding(7.0)
-            .min_size(egui::vec2(72.0, 24.0));
+            .min_size(egui::vec2(120.0, 28.0));
             if ui.add(log_btn).clicked() {
                 app.show_log_window = !app.show_log_window;
             }
         });
     });
-    ui.add_space(8.0);
+
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(6.0);
 
     let mut tasks_to_cancel: Vec<String> = Vec::new();
+    let mut clear_recent = false;
 
-    if running_tasks.is_empty() {
-        // 空状态卡片
-        egui::Frame::none()
-            .fill(c_card)
-            .rounding(10.0)
-            .stroke(egui::Stroke::new(1.0, c_border))
-            .inner_margin(egui::Margin::symmetric(12.0, 18.0))
-            .show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("当前暂无运行中的抢票任务").size(14.0).color(c_gray));
-                    ui.add_space(3.0);
-                    ui.label(egui::RichText::new("开始抢票后，任务会显示在这里").size(12.0).color(c_weak));
-                });
+    egui::ScrollArea::vertical()
+        .id_source("monitor_tab_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // 仅在存在非空服务端公告时展示横幅（无公告时不误报「无法连接服务器」）
+            if let Some(announce) = app
+                .announce3
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                egui::Frame::none()
+                    .fill(palette.notice_fill)
+                    .rounding(8.0)
+                    .stroke(egui::Stroke::new(1.0, palette.notice_border))
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width().max(240.0));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(announce)
+                                    .size(13.5)
+                                    .color(palette.notice_text),
+                            )
+                            .wrap(true),
+                        );
+                    });
+                ui.add_space(10.0);
+            }
+
+            // ================= 运行中任务 =================
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("🎫 运行中任务")
+                        .size(16.5)
+                        .strong()
+                        .color(palette.text_primary),
+                );
+                ui.add_space(6.0);
+                badge(ui, &running_tasks.len().to_string(), palette.pink);
+
+                if running_tasks.len() > 1 {
+                    let any_cancellable = running_tasks
+                        .iter()
+                        .any(|t| !matches!(t.status, TaskStatus::Cancelling));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let cancel_all_btn = egui::Button::new(
+                            egui::RichText::new("全部取消")
+                                .color(egui::Color32::WHITE)
+                                .size(12.5)
+                                .strong(),
+                        )
+                        .fill(palette.cancel)
+                        .rounding(7.0)
+                        .min_size(egui::vec2(76.0, 26.0));
+                        if ui
+                            .add_enabled(any_cancellable, cancel_all_btn)
+                            .on_hover_text("停止所有正在运行的抢票任务")
+                            .clicked()
+                        {
+                            for task in &running_tasks {
+                                if !matches!(task.status, TaskStatus::Cancelling) {
+                                    tasks_to_cancel.push(task.task_id.clone());
+                                }
+                            }
+                        }
+                    });
+                }
             });
-    } else {
-        egui::ScrollArea::vertical()
-            .id_source("running_tasks_scroll")
-            .auto_shrink([false, true])
-            .max_height(320.0)
-            .show(ui, |ui| {
+            ui.add_space(8.0);
+
+            if running_tasks.is_empty() {
+                egui::Frame::none()
+                    .fill(palette.card_fill)
+                    .rounding(10.0)
+                    .stroke(egui::Stroke::new(1.0, palette.card_border))
+                    .inner_margin(egui::Margin::symmetric(14.0, 20.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width().max(240.0));
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("当前暂无运行中的抢票任务")
+                                    .size(14.5)
+                                    .color(palette.text_secondary),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("在「开始抢票」发起任务后，可在此实时查看与取消")
+                                    .size(12.5)
+                                    .color(palette.text_muted),
+                            );
+                        });
+                    });
+            } else {
                 for task in &running_tasks {
                     egui::Frame::none()
-                        .fill(c_card)
+                        .fill(palette.card_fill)
                         .rounding(10.0)
-                        .stroke(egui::Stroke::new(1.0, c_border))
-                        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                        .stroke(egui::Stroke::new(1.0, palette.card_border))
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
                         .show(ui, |ui| {
-                            // 第一行：序号 + 账号 + 模式标签 ……（右）取消
-                            ui.horizontal(|ui| {
-                                badge(ui, &format!("#{}", task.seq), c_slate);
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new(&task.account_name)
-                                        .size(16.0)
-                                        .strong()
-                                        .color(c_dark),
-                                );
-                                ui.add_space(6.0);
-                                badge(ui, grab_mode_label(task.grab_mode), mode_color(task.grab_mode));
+                            ui.set_min_width(ui.available_width().max(240.0));
 
-                                // 右侧操作区
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if let TaskStatus::Failed(msg) = &task.status {
-                                        badge(ui, msg, c_cancelling);
-                                    } else {
+                            // 第一行（固定紧凑元信息 + 右侧操作区，确保计时器与取消按钮永不被长文本挤出）
+                            ui.horizontal(|ui| {
+                                badge(ui, &format!("#{}", task.seq), palette.slate);
+                                ui.add_space(6.0);
+                                badge(
+                                    ui,
+                                    grab_mode_label(task.grab_mode),
+                                    mode_color(task.grab_mode),
+                                );
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "已运行 {}",
+                                        format_elapsed(task.elapsed_secs)
+                                    ))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(palette.text_secondary),
+                                );
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let is_cancelling =
+                                            matches!(task.status, TaskStatus::Cancelling);
                                         let cancel_btn = egui::Button::new(
-                                                egui::RichText::new("取消").color(egui::Color32::WHITE).size(13.0),
-                                            )
-                                            .fill(c_cancel)
-                                            .rounding(7.0)
-                                            .min_size(egui::vec2(54.0, 24.0));
-                                        if ui.add(cancel_btn).on_hover_text("停止该抢票任务").clicked() {
+                                            egui::RichText::new("取消")
+                                                .color(egui::Color32::WHITE)
+                                                .size(12.5),
+                                        )
+                                        .fill(palette.cancel)
+                                        .rounding(7.0)
+                                        .min_size(egui::vec2(54.0, 24.0));
+
+                                        if is_cancelling {
+                                            ui.add_enabled(false, cancel_btn);
+                                            ui.add_space(6.0);
+                                            badge(ui, "取消中...", palette.cancelling);
+                                        } else if ui
+                                            .add(cancel_btn)
+                                            .on_hover_text("停止该抢票任务")
+                                            .clicked()
+                                        {
                                             tasks_to_cancel.push(task.task_id.clone());
                                         }
-                                    }
-                                });
+                                    },
+                                );
                             });
 
                             ui.add_space(6.0);
 
-                            // 第二行：项目 + 已运行时长
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("项目").size(12.0).color(c_weak));
-                                ui.add_space(4.0);
-                                ui.label(egui::RichText::new(&task.project_name).size(13.0).color(c_gray));
-
-                                ui.add_space(16.0);
-
-                                let mins = task.elapsed_secs / 60;
-                                let secs = task.elapsed_secs % 60;
-                                ui.label(egui::RichText::new("已运行").size(12.0).color(c_weak));
-                                ui.add_space(4.0);
+                            // 第二行：账号名称（自动换行）
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
                                 ui.label(
-                                    egui::RichText::new(format!("{:02}:{:02}", mins, secs))
-                                        .size(13.0)
-                                        .strong()
-                                        .color(c_gray),
+                                    egui::RichText::new("账号")
+                                        .size(12.0)
+                                        .color(palette.text_muted),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&task.account_name)
+                                            .size(14.5)
+                                            .strong()
+                                            .color(palette.text_primary),
+                                    )
+                                    .wrap(true),
+                                );
+                            });
+
+                            ui.add_space(3.0);
+
+                            // 第三行：项目名称（自动换行）
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+                                ui.label(
+                                    egui::RichText::new("项目")
+                                        .size(12.0)
+                                        .color(palette.text_muted),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&task.project_name)
+                                            .size(13.5)
+                                            .color(palette.text_secondary),
+                                    )
+                                    .wrap(true),
                                 );
                             });
                         });
                     ui.add_space(8.0);
                 }
+            }
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // ================= 近期任务记录 =================
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("🕘 近期任务记录")
+                        .size(16.5)
+                        .strong()
+                        .color(palette.text_primary),
+                );
+                ui.add_space(6.0);
+                badge(ui, &recent_tasks.len().to_string(), palette.slate);
+
+                if !recent_tasks.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let clear_btn = egui::Button::new(
+                            egui::RichText::new("清空记录")
+                                .size(12.5)
+                                .color(palette.text_primary),
+                        )
+                        .rounding(7.0)
+                        .min_size(egui::vec2(74.0, 26.0));
+                        if ui.add(clear_btn).clicked() {
+                            clear_recent = true;
+                        }
+                    });
+                }
             });
-    }
-    // 借用结束后统一执行取消，避免对 app 的可变借用冲突
+            ui.add_space(8.0);
+
+            if recent_tasks.is_empty() {
+                egui::Frame::none()
+                    .fill(palette.card_fill)
+                    .rounding(10.0)
+                    .stroke(egui::Stroke::new(1.0, palette.card_border))
+                    .inner_margin(egui::Margin::symmetric(14.0, 16.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width().max(240.0));
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("暂无近期已结束的任务记录")
+                                    .size(13.5)
+                                    .color(palette.text_muted),
+                            );
+                        });
+                    });
+            } else {
+                for task in &recent_tasks {
+                    let (status_label, status_color, msg_color) = match &task.status {
+                        TaskStatus::Completed(true) => {
+                            ("成功", palette.success, palette.success)
+                        }
+                        TaskStatus::Cancelled => {
+                            ("已取消", palette.cancelled_gray, palette.text_secondary)
+                        }
+                        TaskStatus::Failed(_) | TaskStatus::Completed(false) => {
+                            ("失败", palette.failed_red, palette.failed_red)
+                        }
+                        _ => ("已结束", palette.slate, palette.text_secondary),
+                    };
+
+                    let duration_secs = task
+                        .finished_at
+                        .saturating_duration_since(task.started_at)
+                        .as_secs();
+
+                    egui::Frame::none()
+                        .fill(palette.card_fill)
+                        .rounding(10.0)
+                        .stroke(egui::Stroke::new(1.0, palette.card_border))
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width().max(240.0));
+
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+                                badge(ui, status_label, status_color);
+                                badge(
+                                    ui,
+                                    grab_mode_label(task.grab_mode),
+                                    mode_color(task.grab_mode),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "耗时 {}",
+                                        format_elapsed(duration_secs)
+                                    ))
+                                    .size(12.5)
+                                    .color(palette.text_secondary),
+                                );
+                                if !task.project_id.trim().is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(format!("ID: {}", task.project_id))
+                                            .size(12.0)
+                                            .color(palette.text_muted),
+                                    );
+                                }
+                            });
+
+                            ui.add_space(6.0);
+
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+                                ui.label(
+                                    egui::RichText::new("账号")
+                                        .size(12.0)
+                                        .color(palette.text_muted),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&task.account_name)
+                                        .size(13.5)
+                                        .strong()
+                                        .color(palette.text_primary),
+                                );
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new("项目")
+                                        .size(12.0)
+                                        .color(palette.text_muted),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&task.project_name)
+                                            .size(13.5)
+                                            .color(palette.text_secondary),
+                                    )
+                                    .wrap(true),
+                                );
+                            });
+
+                            let detail = task.message.trim();
+                            if !detail.is_empty() {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("结果：{}", detail))
+                                            .size(12.5)
+                                            .color(msg_color),
+                                    )
+                                    .wrap(true),
+                                );
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+            }
+
+            ui.add_space(12.0);
+        });
+
     for task_id in tasks_to_cancel {
         match app.task_manager.cancel_task(&task_id) {
             Ok(_) => log::info!("已请求取消任务: {}", task_id),
             Err(e) => log::error!("取消任务失败: {}", e),
         }
+    }
+
+    if clear_recent {
+        app.task_manager.clear_recent_tasks();
+        app.show_info("已清空近期任务记录");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_elapsed;
+
+    #[test]
+    fn formats_seconds_below_and_above_one_hour() {
+        assert_eq!(format_elapsed(0), "00:00");
+        assert_eq!(format_elapsed(5), "00:05");
+        assert_eq!(format_elapsed(65), "01:05");
+        assert_eq!(format_elapsed(3599), "59:59");
+        assert_eq!(format_elapsed(3600), "01:00:00");
+        assert_eq!(format_elapsed(3661), "01:01:01");
     }
 }

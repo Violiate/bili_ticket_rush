@@ -1,61 +1,256 @@
-use common::cookie_manager::CookieManager;
-use common::http_utils::request_get;
-use common::ticket::{*};
-use common::gen_cp::CTokenGenerator;
-use serde_json;
-use common::login::QrCodeLoginStatus;
-use reqwest::Client;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
-use serde_json::{json, Value};
-use rand::{thread_rng, Rng};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-fn cache_path(project_id: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new("cache");
-    dir.join(format!("project_{}.json", project_id))
+use common::cookie_manager::CookieManager;
+use common::gen_cp::CTokenGenerator;
+use common::login::QrCodeLoginStatus;
+use common::ticket::*;
+use rand::{thread_rng, Rng};
+use reqwest::Client;
+use serde_json::{json, Value};
+use tokio::sync::watch;
+
+/// 内部错误码：网络传输/超时失败（与 HTTP 412 风控严格区分）
+pub const ERR_NETWORK: i32 = -1001;
+/// 内部错误码：响应 JSON 解析失败或关键字段缺失
+pub const ERR_PARSE: i32 = -1002;
+/// 内部错误码：本地传参错误（不可通过重试修复）
+pub const ERR_INVALID_PARAM: i32 = 999;
+/// 内部错误码：id_bind 字段值非法
+pub const ERR_ID_BIND_INVALID: i32 = 919;
+
+const DEFAULT_QRCODE_POLL_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+pub(crate) fn extract_api_message(json: &Value) -> String {
+    json.get("msg")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            json.get("message")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            json.get("data")
+                .and_then(|d| d.get("message"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            json.get("data")
+                .and_then(|d| d.get("msg"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("未知错误")
+        .to_string()
 }
 
-fn save_project_cache(project_id: &str, info: &InfoResponse) {
-    let path = cache_path(project_id);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+/// 统一检查 B站接口返回中的 `errno` 与 `code`：
+/// - 只要任一存在且非 0，返回 `Some((err_code, msg))`
+/// - 若 `errno` 与 `code` 同时缺失，也判定为错误并返回 `Some((-1, msg))`
+/// - 绝不将真正的 `-1` 错误码与字段缺失混淆
+pub(crate) fn extract_api_error(json: &Value) -> Option<(i64, String)> {
+    let errno = json.get("errno").and_then(|v| v.as_i64());
+    let code = json.get("code").and_then(|v| v.as_i64());
+
+    match (errno, code) {
+        (Some(e), _) if e != 0 => Some((e, extract_api_message(json))),
+        (_, Some(c)) if c != 0 => Some((c, extract_api_message(json))),
+        (None, None) => Some((-1, extract_api_message(json))),
+        _ => None,
     }
-    match serde_json::to_string_pretty(info) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                log::warn!("保存项目缓存失败: {}", e);
-            } else {
-                log::info!("已缓存项目信息到 {:?}", path);
+}
+
+/// 从 createV2 响应中提取订单号，兼容 i64 / u64 / 大整数字符串雪花 ID
+pub fn extract_order_id(order_result: &Value) -> Option<String> {
+    let val = order_result
+        .get("data")
+        .and_then(|d| d.get("orderId").or_else(|| d.get("order_id")))
+        .or_else(|| order_result.get("orderId"))
+        .or_else(|| order_result.get("order_id"))?;
+
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() && trimmed != "0" {
+            return Some(trimmed.to_string());
+        }
+        return None;
+    }
+    if let Some(n) = val.as_i64() {
+        if n > 0 {
+            return Some(n.to_string());
+        }
+        return None;
+    }
+    if let Some(n) = val.as_u64() {
+        if n > 0 {
+            return Some(n.to_string());
+        }
+        return None;
+    }
+    None
+}
+
+fn sanitize_cache_id(project_id: &str) -> String {
+    let sanitized: String = project_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn cache_path(project_id: &str) -> PathBuf {
+    let safe_id = sanitize_cache_id(project_id);
+    Path::new("cache").join(format!("project_{}.json", safe_id))
+}
+
+async fn save_project_cache_async(project_id: String, info: InfoResponse) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let path = cache_path(&project_id);
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("创建项目缓存目录失败: {}", e);
+                return;
             }
         }
-        Err(e) => log::warn!("序列化项目缓存失败: {}", e),
-    }
+        let json = match serde_json::to_string_pretty(&info) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("序列化项目缓存失败: {}", e);
+                return;
+            }
+        };
+        let tmp_name = format!(
+            "project_{}.{}.tmp",
+            sanitize_cache_id(&project_id),
+            uuid::Uuid::new_v4()
+        );
+        let tmp_path = path
+            .parent()
+            .map(|p| p.join(&tmp_name))
+            .unwrap_or_else(|| PathBuf::from(&tmp_name));
+
+        if let Err(e) = std::fs::write(&tmp_path, &json) {
+            log::warn!("写入项目缓存临时文件失败: {}", e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            log::warn!("原子替换项目缓存失败: {}", e);
+            let _ = std::fs::remove_file(&tmp_path);
+        } else {
+            log::info!("已缓存项目信息到 {:?}", path);
+        }
+    })
+    .await;
 }
 
-fn load_project_cache(project_id: &str) -> Option<InfoResponse> {
-    let path = cache_path(project_id);
-    match std::fs::read_to_string(&path) {
-        Ok(json) => {
-            match serde_json::from_str::<InfoResponse>(&json) {
+pub(crate) fn parse_and_validate_project_cache(json: &str) -> Result<InfoResponse, String> {
+    let mut info = serde_json::from_str::<InfoResponse>(json)
+        .map_err(|e| format!("解析本地缓存失败: {}", e))?;
+    info.data.fill_missing_sale_begin();
+    info.data.validate()?;
+    Ok(info)
+}
+
+async fn load_project_cache_async(project_id: String) -> Option<InfoResponse> {
+    tokio::task::spawn_blocking(move || {
+        let path = cache_path(&project_id);
+        match std::fs::read_to_string(&path) {
+            Ok(json) => match parse_and_validate_project_cache(&json) {
                 Ok(info) => {
                     log::info!("已从本地缓存加载项目信息: {:?}", path);
                     Some(info)
                 }
                 Err(e) => {
-                    log::warn!("解析本地缓存失败: {}", e);
+                    log::warn!("本地缓存 {:?} 无效，已跳过: {}", path, e);
                     None
                 }
-            }
+            },
+            Err(_) => None,
         }
-        Err(_) => None,
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+pub(crate) fn parse_server_now_response(text: &str) -> Result<i64, String> {
+    let json_data: Value =
+        serde_json::from_str(text).map_err(|e| format!("JSON解析失败: {}", e))?;
+    let now_sec = json_data["data"]["now"].as_i64().unwrap_or(0);
+    if now_sec > 0 {
+        Ok(now_sec)
+    } else {
+        Err("返回时间戳为0或缺失".to_string())
     }
 }
 
+/// 严格获取 B 站服务器秒级时间戳；失败时返回 Err，绝不静默回退到本地时钟。
+pub async fn fetch_server_now_sec(cookie_manager: Arc<CookieManager>) -> Result<i64, String> {
+    let url = "https://api.bilibili.com/x/click-interface/click/now";
+    let response = cookie_manager.get(url).await;
+    let resp = response
+        .send()
+        .await
+        .map_err(|e| format!("网络请求失败: {}", e))?;
 
-pub async fn get_countdown(cookie_manager: Arc<CookieManager>, info: Option<TicketInfo>) -> Result<f64, String> {
-    // 获取开始时间 (秒级)
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取响应失败: {}", e))?;
+    log::debug!("时间接口原始响应：{}", text);
+
+    let now_sec = parse_server_now_response(&text)?;
+    log::debug!("解析出的网络时间(秒级)：{}", now_sec);
+    Ok(now_sec)
+}
+
+pub async fn get_countdown_from_ts(
+    cookie_manager: Arc<CookieManager>,
+    sale_begin_sec: i64,
+) -> Result<f64, String> {
+    log::debug!("获取开始时间(秒级)：{}", sale_begin_sec);
+
+    let now_sec = match fetch_server_now_sec(cookie_manager).await {
+        Ok(ts) => ts,
+        Err(reason) => {
+            let local_sec = chrono::Utc::now().timestamp();
+            log::warn!(
+                "获取B站服务器时间失败({})，已回退使用本地系统时间({})，请确保本机时钟已校时",
+                reason,
+                local_sec
+            );
+            local_sec
+        }
+    };
+
+    let countdown_sec = sale_begin_sec - now_sec;
+    log::debug!(
+        "计算倒计时(秒)：开始时间[{}] - 当前时间[{}] = 倒计时[{}]秒",
+        sale_begin_sec,
+        now_sec,
+        countdown_sec
+    );
+
+    Ok(countdown_sec as f64)
+}
+
+pub async fn get_countdown(
+    cookie_manager: Arc<CookieManager>,
+    info: Option<TicketInfo>,
+) -> Result<f64, String> {
     let sale_begin_sec = match info {
         Some(info) => match info.sale_begin {
             Some(v) => v,
@@ -63,124 +258,184 @@ pub async fn get_countdown(cookie_manager: Arc<CookieManager>, info: Option<Tick
         },
         None => return Err("获取开始时间失败".to_string()),
     };
-    log::debug!("获取开始时间(秒级)：{}", sale_begin_sec);
-    
-    // 获取网络时间 (秒级)
-    let url = "https://api.bilibili.com/x/click-interface/click/now";
-    let response = cookie_manager.get(url).await;
-    let now_sec = match response.send().await {
-        Ok(data) => {
-            let text = data.text().await.unwrap_or_default();
-            log::debug!("API原始响应：{}", text);
-            
-            let json_data: serde_json::Value = serde_json::from_str(&text).unwrap_or(
-                json!({
-                    "code": 0,
-                    "data": {
-                        "now": 0
-                    }
-                })
-            );
-            
-            
-            let now_sec = json_data["data"]["now"].as_i64().unwrap_or(0);
-            log::debug!("解析出的网络时间(秒级)：{}", now_sec);
-            now_sec
-        }
-        Err(e) => {
-            log::debug!("获取网络时间失败，原因：{}", e);
-            0
-        }
-    };
-    
-    // 如果网络时间获取失败，使用本地时间 (转换为秒)
-    let now_sec = if now_sec == 0 {
-        log::debug!("使用本地时间");
-        let local_sec = chrono::Utc::now().timestamp();
-        log::debug!("本地时间(秒级)：{}", local_sec);
-        local_sec
-    } else {
-        now_sec
-    };
-    
-    // 计算倒计时(秒级)
-    let countdown_sec = sale_begin_sec - now_sec;
-    log::debug!("计算倒计时(秒)：开始时间[{}] - 当前时间[{}] = 倒计时[{}]秒", 
-               sale_begin_sec, now_sec, countdown_sec);
-    
-    Ok(countdown_sec as f64)
+    get_countdown_from_ts(cookie_manager, sale_begin_sec).await
 }
 
+pub async fn get_buyer_info(
+    cookie_manager: Arc<CookieManager>,
+) -> Result<BuyerInfoResponse, String> {
+    let req = cookie_manager
+        .get("https://show.bilibili.com/api/ticket/buyer/list")
+        .await;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
 
-pub async fn get_buyer_info(cookie_manager: Arc<CookieManager>) -> Result<BuyerInfoResponse,String>{
-    let req = cookie_manager.get("https://show.bilibili.com/api/ticket/buyer/list").await;
-    let response = req.send().await;
-    match response {
-        Ok(resp)=>{
-            if resp.status().is_success(){
-                match tokio::task::block_in_place(||{
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(resp.text())
-                }){
-                    Ok(text) => {
-                        log::debug!("获取购票人信息：{}",text);
-                        match serde_json::from_str::<BuyerInfoResponse>(&text){
-                            Ok(buyer_info) => {
-                                return Ok(buyer_info);
-                            }
-                            Err(e) => {
-                                log::error!("获取购票人信息json解析失败：{}",e);
-                                return Err(format!("获取购票人信息json解析失败：{}",e))
-                            }
-
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("获取购票人信息失败：{}",e);
-                        return Err(format!("获取购票人信息失败：{}",e))
-                    }
-
-                }
-            }
-            else{
-                
-                log::debug!("请求响应失败: {:?}", resp);
-                return Err(format!("请求响应失败: {}", resp.status()));
-            }
-        }
-        Err(e) => {
-            Err(format!("请求失败: {}", e))
-        }
+    if !resp.status().is_success() {
+        log::debug!("获取购票人请求响应失败: {:?}", resp.status());
+        return Err(format!("请求响应失败: {}", resp.status()));
     }
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("获取购票人信息失败：{}", e))?;
+    log::debug!("获取购票人信息：{}", text);
+
+    let raw: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("获取购票人信息json解析失败：{}", e))?;
+    if let Some((err_code, msg)) = extract_api_error(&raw) {
+        return Err(format!("获取购票人信息失败({})：{}", err_code, msg));
+    }
+
+    let buyer_info: BuyerInfoResponse = serde_json::from_value(raw)
+        .map_err(|e| format!("获取购票人信息数据解析失败：{}", e))?;
+
+    if buyer_info.errno != 0 || buyer_info.code != 0 {
+        let err_code = if buyer_info.errno != 0 {
+            buyer_info.errno
+        } else {
+            buyer_info.code
+        };
+        let msg = if !buyer_info.msg.is_empty() {
+            buyer_info.msg.clone()
+        } else if !buyer_info.message.is_empty() {
+            buyer_info.message.clone()
+        } else {
+            "未知错误".to_string()
+        };
+        return Err(format!("获取购票人信息失败({})：{}", err_code, msg));
+    }
+
+    Ok(buyer_info)
 }
 
-pub async fn get_project(cookie_manager: Arc<CookieManager>, project_id : &str, referer_link: &str) -> Result<InfoResponse,String>{
-    let replace_referer: HashMap<&str, &str> = HashMap::from([
-        ("Referer", referer_link),
-       
-    ]);
-    let req = cookie_manager.get_with_headers(format!("https://show.bilibili.com/api/ticket/project/getV2?id={}&project_id={}",project_id, project_id).as_str(),replace_referer).await;
-    let response = req.send().await;
+pub async fn add_buyer(
+    cookie_manager: Arc<CookieManager>,
+    name: &str,
+    phone: &str,
+    id_type: i32,
+    id_number: &str,
+    as_default_buyer: bool,
+) -> Result<String, String> {
+    let name = name.trim();
+    let phone = phone.trim();
+    let id_number = id_number.trim();
+
+    if name.is_empty() {
+        return Err("购票人姓名不能为空".to_string());
+    }
+    if phone.is_empty() {
+        return Err("购票人手机号不能为空".to_string());
+    }
+    if id_number.is_empty() {
+        return Err("购票人证件号码不能为空".to_string());
+    }
+    if !(0..=3).contains(&id_type) {
+        return Err(format!("不支持的证件类型: {}", id_type));
+    }
+
+    let payload = json!({
+        "name": name,
+        "tel": phone,
+        "id_type": id_type,
+        "personal_id": id_number,
+        "is_default": if as_default_buyer { "1" } else { "0" },
+        "src": "ticket",
+    });
+
+    let resp = cookie_manager
+        .post("https://show.bilibili.com/api/ticket/buyer/create")
+        .await
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("添加购票人请求失败: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("添加购票人 HTTP 请求失败: {}", resp.status()));
+    }
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读取添加购票人响应失败: {}", e))?;
+
+    let json_val: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("解析添加购票人响应失败: {}", e))?;
+
+    if let Some((err_code, msg)) = extract_api_error(&json_val) {
+        return Err(format!("添加购票人失败({}): {}", err_code, msg));
+    }
+
+    Ok("添加购票人成功".to_string())
+}
+
+pub async fn get_project_with_options(
+    cookie_manager: Arc<CookieManager>,
+    project_id: &str,
+    referer_link: Option<String>,
+    allow_cache_fallback: bool,
+) -> Result<InfoResponse, String> {
+    let base_url = "https://show.bilibili.com/api/ticket/project/getV2";
+    let req = match referer_link.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(referer) => {
+            let headers: HashMap<&str, &str> = HashMap::from([("Referer", referer)]);
+            cookie_manager.get_with_headers(base_url, headers).await
+        }
+        None => cookie_manager.get(base_url).await,
+    };
+
+    let response = req
+        .query(&[("id", project_id), ("project_id", project_id)])
+        .send()
+        .await;
+
     let result = match response {
-        Ok(resp)=>{
-            if resp.status().is_success(){
-                match tokio::task::block_in_place(||{
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(resp.text())
-                }){
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.text().await {
                     Ok(text) => {
-                        log::debug!("获取项目详情：{}",text);
-                        // 尝试常规解析
-                        match serde_json::from_str::<InfoResponse>(&text){
-                            Ok(mut ticket_info) => {
-                                // 补全缺失的 sale_begin（从 screen_list 提取）
-                                ticket_info.data.fill_missing_sale_begin();
-                                
-                                // 校验关键字段是否缺失
-                                if let Err(e) = ticket_info.data.validate() {
-                                    Err(e)
+                        log::debug!("获取项目详情：{}", text);
+                        match serde_json::from_str::<Value>(&text) {
+                            Ok(raw) => {
+                                if let Some((err_code, msg)) = extract_api_error(&raw) {
+                                    Err(format!("获取项目详情失败({})：{}", err_code, msg))
                                 } else {
-                                    Ok(ticket_info)
+                                    match serde_json::from_value::<InfoResponse>(raw) {
+                                        Ok(mut ticket_info) => {
+                                            if ticket_info.errno != 0 || ticket_info.code != 0 {
+                                                let err_code = if ticket_info.errno != 0 {
+                                                    ticket_info.errno
+                                                } else {
+                                                    ticket_info.code
+                                                };
+                                                let msg = if !ticket_info.msg.is_empty() {
+                                                    ticket_info.msg.clone()
+                                                } else if !ticket_info.message.is_empty() {
+                                                    ticket_info.message.clone()
+                                                } else {
+                                                    "未知错误".to_string()
+                                                };
+                                                Err(format!(
+                                                    "获取项目详情失败({})：{}",
+                                                    err_code, msg
+                                                ))
+                                            } else {
+                                                ticket_info.data.fill_missing_sale_begin();
+                                                if let Err(e) = ticket_info.data.validate() {
+                                                    Err(e)
+                                                } else {
+                                                    Ok(ticket_info)
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::error!("获取项目详情json解析失败：{}", e);
+                                            Err(format!("获取项目详情json解析失败：{}", e))
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -194,331 +449,603 @@ pub async fn get_project(cookie_manager: Arc<CookieManager>, project_id : &str, 
                         Err(format!("获取项目详情失败：{}", e))
                     }
                 }
-            }
-            else{
-                log::debug!("请求响应失败: {:?}", resp);
+            } else {
+                log::debug!("请求响应失败: {:?}", resp.status());
                 Err(format!("请求响应失败: {}", resp.status()))
             }
         }
-        Err(e) => {
-            Err(format!("请求失败: {}", e))
-        }
+        Err(e) => Err(format!("请求失败: {}", e)),
     };
 
-    // 成功时缓存到本地，失败时尝试从缓存加载
     match result {
         Ok(info) => {
-            save_project_cache(project_id, &info);
+            if allow_cache_fallback {
+                save_project_cache_async(project_id.to_string(), info.clone()).await;
+            }
             Ok(info)
         }
         Err(e) => {
-            log::warn!("在线获取项目信息失败({}), 尝试从本地缓存加载...", e);
-            match load_project_cache(project_id) {
-                Some(cached) => {
-                    log::info!("已降级使用本地缓存的项目信息");
-                    Ok(cached)
+            if allow_cache_fallback {
+                log::warn!("在线获取项目信息失败({}), 尝试从本地缓存加载...", e);
+                match load_project_cache_async(project_id.to_string()).await {
+                    Some(cached) => {
+                        log::info!("已降级使用本地缓存的项目信息");
+                        Ok(cached)
+                    }
+                    None => Err(e),
                 }
-                None => Err(e),
+            } else {
+                Err(e)
             }
         }
     }
 }
 
-
-//轮询登录状态
-pub async fn poll_qrcode_login(qrcode_key: &str,user_agent: Option<&str>) ->QrCodeLoginStatus {
-    
-    
-    let client_builder = Client::builder();
-    let client = if let Some(ua) = user_agent {
-        client_builder.user_agent(ua)
+pub async fn get_project(
+    cookie_manager: Arc<CookieManager>,
+    project_id: &str,
+    referer_link: &str,
+) -> Result<InfoResponse, String> {
+    let referer = if referer_link.trim().is_empty() {
+        None
     } else {
-        client_builder.user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0 Safari/537.36")
-    }.build()
-    .unwrap_or_default();
-    
-    let max_attempts = 60;
-    
-    for attempt in 1..max_attempts{
-
-    
-    //轮询
-    let response = match request_get(
-        &client,
-        &format!("https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key={}", qrcode_key),
-       
-        None,
-    ).await {
-        Ok(resp) => resp,
-        Err(e) => return QrCodeLoginStatus::Failed(e.to_string()),
+        Some(referer_link.to_string())
     };
+    get_project_with_options(cookie_manager, project_id, referer, true).await
+}
 
-    let mut all_cookies = Vec::new();
-    let cookie_headers = response.headers().get_all(reqwest::header::SET_COOKIE);
-    for value in cookie_headers {
-     if let Ok(cookie_str) = value.to_str() {
-        
-        if let Some(end_pos) = cookie_str.find(';') {
-            all_cookies.push(cookie_str[0..end_pos].to_string());
-        } else {
-            all_cookies.push(cookie_str.to_string());
+fn upsert_cookie(cookies: &mut Vec<(String, String)>, name: &str, value: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    if let Some(existing) = cookies.iter_mut().find(|(k, _)| k == name) {
+        existing.1 = value.to_string();
+    } else {
+        cookies.push((name.to_string(), value.to_string()));
+    }
+}
+
+async fn wait_cancel_rx(cancel_rx: &mut watch::Receiver<bool>) {
+    if *cancel_rx.borrow() {
+        return;
+    }
+    while cancel_rx.changed().await.is_ok() {
+        if *cancel_rx.borrow() {
+            return;
         }
     }
+    // 发送端已被丢弃且未发送 true，避免误触发取消
+    std::future::pending::<()>().await;
+}
+
+async fn poll_qrcode_login_with_config(
+    poll_url: &str,
+    qrcode_key: &str,
+    user_agent: Option<&str>,
+    poll_interval: Duration,
+    mut cancel_rx: watch::Receiver<bool>,
+    mut on_scanning: impl FnMut(),
+) -> QrCodeLoginStatus {
+    if *cancel_rx.borrow() {
+        return QrCodeLoginStatus::Failed("任务已取消".to_string());
     }
-    
-    let json = match response.json::<serde_json::Value>().await {
-        Ok(j) => j,
-        Err(e) => return QrCodeLoginStatus::Failed(e.to_string()),
-    };
-    
-    
-    let code = json["data"]["code"]
-        .as_i64()
-        .or_else(|| json["code"].as_i64().filter(|&c| c != 0))
-        .unwrap_or(-1);
-    match code {
-        0 => {
-            //json获取cookie
-            
-            if let Some(cookie_info) = json["data"]["cookie_info"].as_object() {
-                for (key, value) in cookie_info {
-                    if let Some(val_str) = value["value"].as_str() {
-                        all_cookies.push(format!("{}={}", key, val_str));
+
+    let ua = user_agent
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_QRCODE_POLL_UA);
+
+    let mut client_builder = Client::builder()
+        .user_agent(ua)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15));
+    if poll_url.starts_with("http://127.0.0.1") || poll_url.starts_with("http://localhost") {
+        client_builder = client_builder.no_proxy();
+    }
+    let client = client_builder.build().unwrap_or_default();
+
+    let max_attempts: u32 = 60;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 3;
+    let mut consecutive_errors: u32 = 0;
+    let mut scanning_notified = false;
+
+    for attempt in 1..=max_attempts {
+        if *cancel_rx.borrow() {
+            return QrCodeLoginStatus::Failed("任务已取消".to_string());
+        }
+
+        let send_fut = client
+            .get(poll_url)
+            .query(&[("qrcode_key", qrcode_key)])
+            .send();
+
+        let response = tokio::select! {
+            res = send_fut => match res {
+                Ok(resp) => resp,
+                Err(e) => {
+                    consecutive_errors += 1;
+                    log::warn!(
+                        "轮询二维码状态网络错误 ({}/{}): {}",
+                        consecutive_errors,
+                        MAX_CONSECUTIVE_ERRORS,
+                        e
+                    );
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        return QrCodeLoginStatus::Failed(format!("网络错误: {}", e));
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(poll_interval) => {}
+                        _ = wait_cancel_rx(&mut cancel_rx) => {
+                            return QrCodeLoginStatus::Failed("任务已取消".to_string());
+                        }
+                    }
+                    continue;
+                }
+            },
+            _ = wait_cancel_rx(&mut cancel_rx) => {
+                return QrCodeLoginStatus::Failed("任务已取消".to_string());
+            }
+        };
+
+        if !response.status().is_success() {
+            consecutive_errors += 1;
+            let status = response.status();
+            log::warn!(
+                "轮询二维码状态返回非成功 HTTP 状态 ({}/{}): {}",
+                consecutive_errors,
+                MAX_CONSECUTIVE_ERRORS,
+                status
+            );
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                return QrCodeLoginStatus::Failed(format!("服务器返回错误状态: {}", status));
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {}
+                _ = wait_cancel_rx(&mut cancel_rx) => {
+                    return QrCodeLoginStatus::Failed("任务已取消".to_string());
+                }
+            }
+            continue;
+        }
+
+        let mut deduped_cookies: Vec<(String, String)> = Vec::new();
+        for value in response.headers().get_all(reqwest::header::SET_COOKIE) {
+            if let Ok(cookie_str) = value.to_str() {
+                let kv = match cookie_str.find(';') {
+                    Some(end_pos) => &cookie_str[0..end_pos],
+                    None => cookie_str,
+                };
+                if let Some((k, v)) = kv.split_once('=') {
+                    upsert_cookie(&mut deduped_cookies, k, v);
+                }
+            }
+        }
+
+        let json = tokio::select! {
+            res = response.json::<Value>() => match res {
+                Ok(j) => j,
+                Err(e) => {
+                    consecutive_errors += 1;
+                    log::warn!(
+                        "解析二维码轮询响应失败 ({}/{}): {}",
+                        consecutive_errors,
+                        MAX_CONSECUTIVE_ERRORS,
+                        e
+                    );
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        return QrCodeLoginStatus::Failed(format!("解析响应失败: {}", e));
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(poll_interval) => {}
+                        _ = wait_cancel_rx(&mut cancel_rx) => {
+                            return QrCodeLoginStatus::Failed("任务已取消".to_string());
+                        }
+                    }
+                    continue;
+                }
+            },
+            _ = wait_cancel_rx(&mut cancel_rx) => {
+                return QrCodeLoginStatus::Failed("任务已取消".to_string());
+            }
+        };
+
+        // 收到合法响应后清零连续瞬时错误计数
+        consecutive_errors = 0;
+
+        let code = extract_qrcode_poll_code(&json);
+        match code {
+            0 => {
+                if let Some(cookie_info) = json["data"]["cookie_info"].as_object() {
+                    for (key, value) in cookie_info {
+                        if let Some(val_str) = value["value"].as_str() {
+                            upsert_cookie(&mut deduped_cookies, key, val_str);
+                        }
                     }
                 }
-            }
-            
-            
-            if !all_cookies.is_empty() {
-                return QrCodeLoginStatus::Success(all_cookies.join("; "));
-            } else {
-                return QrCodeLoginStatus::Failed("无法获取Cookie信息".to_string());
-            }
-        },
-        86038 => return QrCodeLoginStatus::Expired,
-        86090 => {
-            log::info!("二维码已扫描，等待确认 (尝试 {} / {} 次)", attempt, max_attempts);
-            //return QrCodeLoginStatus::Scanning;
-        },
-        86101 => {
-            log::info!("二维码已生成，等待扫描 (尝试 {} / {} 次)", attempt, max_attempts);
-            //return QrCodeLoginStatus::Pending
-        },
-        _ => {
-            let message = json["data"]["message"]
-                .as_str()
-                .or_else(|| json["message"].as_str())
-                .unwrap_or("未知错误");
 
-            return QrCodeLoginStatus::Failed(message.to_string())
-        }
-    }
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-}
-QrCodeLoginStatus::Expired
-}
-
-
-pub async fn get_ticket_token(cookie_manager:Arc<CookieManager>, 
-    cpdd: Arc<Mutex<CTokenGenerator>>,
-    project_id : &str , screen_id: &str, ticket_id: &str, count: i16,is_hot: bool) 
-    -> Result<(String,String),TokenRiskParam>{
-    
-    
-
-    let params = if is_hot {
-        json!({
-            "count": count,
-            "screen_id": screen_id.parse::<i64>().unwrap_or(0),
-            "order_type": 1,
-            "project_id": project_id.parse::<i64>().unwrap_or(0),
-            "sku_id": ticket_id.parse::<i64>().unwrap_or(0),
-            
-            
-            "token": cpdd.lock().unwrap().generate_ctoken(false),
-            "newRisk": true,
-            "requestSource": "neul-next",
-        })
-    } else {
-        json!({
-            "count": count,
-            "screen_id": screen_id.parse::<i64>().unwrap_or(0),
-            "order_type": 1,
-            "project_id": project_id.parse::<i64>().unwrap_or(0),
-            "sku_id": ticket_id.parse::<i64>().unwrap_or(0),
-            
-            "token": "",
-            "newRisk": true,
-            "requestSource": "neul-next",
-        })
-    };
-    log::debug!("获取票token参数：{:?}", params);
-    let url = format!("https://show.bilibili.com/api/ticket/order/prepare?project_id={}",project_id);
-    // 热门项目prepare 走 HTTP/2（与 createV2 同一个 h2 客户端），用桌面 Chrome 身份（默认 UA），
-    let response = if is_hot {
-        cookie_manager
-            .post_with_headers_h2(&url, HashMap::new()).await
-            .json(&params)
-            .send()
-            .await
-    } else {
-        cookie_manager
-            .post(&url).await
-            .json(&params)
-            .send()
-            .await
-    };
-    match response {
-        Ok(resp) => {
-            if resp.status().is_success(){
-                match tokio::task::block_in_place(||{
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(resp.json::<serde_json::Value>())
-                }){
-                    Ok(json) => {
-                        log::debug!("获取票token：{}",json);
-                        let errno_value = json.get("errno").and_then(|v| v.as_i64()).unwrap_or(-1);
-                        let code_value = json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-                        let code = if errno_value != -1 { errno_value } else { code_value };
-                        let msg = json["msg"].as_str().unwrap_or("未知错误");
-                        
-                        match code {
-                            0 => {
-                                let token = json["data"]["token"].as_str().unwrap_or("");
-                                if is_hot {
-                                    let ptoken = json["data"]["ptoken"].as_str().unwrap_or("");
-                                    return Ok((token.to_string(), ptoken.to_string()));
-                                }
-                                return Ok((token.to_string(), String::new()));
-                            }
-                            -401 | 401 => {
-                                log::info!("需要进行人机验证");
-                                let mid = json["data"]["ga_data"]["riskParams"]["mid"].as_str().unwrap_or("");
-                                let decision_type = json["data"]["ga_data"]["riskParams"]["decision_type"].as_str().unwrap_or("");
-                                let buvid = json["data"]["ga_data"]["riskParams"]["buvid"].as_str().unwrap_or("");
-                                let ip = json["data"]["ga_data"]["riskParams"]["ip"].as_str().unwrap_or("");
-                                let scene = json["data"]["ga_data"]["riskParams"]["scene"].as_str().unwrap_or("");
-                                let ua = json["data"]["ga_data"]["riskParams"]["ua"].as_str().unwrap_or("");
-                                let v_voucher = json["data"]["ga_data"]["riskParams"]["v_voucher"].as_str().unwrap_or("");
-                                let risk_param = json["data"]["ga_data"]["riskParams"].clone();
-                                let token_risk_param = TokenRiskParam {
-                                    code: code as i32,
-                                    
-                                    message: msg.to_string(),
-                                    mid: Some(mid.to_string()),
-                                    decision_type: Some(decision_type.to_string()),
-                                    buvid: Some(buvid.to_string()),
-                                    ip: Some(ip.to_string()),
-                                    scene: Some(scene.to_string()),
-                                    ua: Some(ua.to_string()),
-                                    v_voucher: Some(v_voucher.to_string()),
-                                    risk_param: Some(risk_param.clone()),
-                                };
-                                log::debug!("{:?}", token_risk_param);
-                                return Err(token_risk_param);
-                            }
-                            _ => {
-                                log::error!("获取token失败，未知错误码：{}，错误信息：{}，可提issue收集此问题", code, msg);
-                                log::error!("{:?}", json);
-                                return Err(TokenRiskParam {
-                                    code: code as i32,
-                                   
-                                    message: msg.to_string(),
-                                    mid: None,
-                                    decision_type: None,
-                                    buvid: None,
-                                    ip: None,
-                                    scene: None,
-                                    ua: None,
-                                    v_voucher: None,
-                                    risk_param: None,
-                                });
-                            }
-                        }
-                },
-                Err(e) => {
-                    log::error!("解析票务token响应失败: {}", e);
-                    return Err(TokenRiskParam{
-
-                        code: 999 as i32,
-                        
-                        message: e.to_string(),
-                        
-                        mid: None,
-                        decision_type: None,
-                        buvid: None,
-                        ip: None,
-                        scene: None,
-                        ua: None,
-                        v_voucher: None,
-                        risk_param: None,
-                    })
+                if !deduped_cookies.is_empty() {
+                    let cookie_str = deduped_cookies
+                        .into_iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return QrCodeLoginStatus::Success(cookie_str);
+                } else {
+                    return QrCodeLoginStatus::Failed("无法获取Cookie信息".to_string());
                 }
             }
-            }else{
-                log::error!("获取票token失败，服务器不期待响应，响应状态码：{}",resp.status());
-                return Err(TokenRiskParam{
-                    code: 999 as i32,
-                    
-                    message: resp.status().to_string(),
-                    
-                    mid: None,
-                    decision_type: None,
-                    buvid: None,
-                    ip: None,
-                    scene: None,
-                    ua: None,
-                    v_voucher: None,
-                    risk_param: None,
-                });
+            86038 => return QrCodeLoginStatus::Expired,
+            86090 => {
+                if !scanning_notified {
+                    scanning_notified = true;
+                    on_scanning();
+                }
+                log::info!(
+                    "二维码已扫描，等待确认 (尝试 {} / {} 次)",
+                    attempt,
+                    max_attempts
+                );
+            }
+            86101 => {
+                log::info!(
+                    "二维码已生成，等待扫描 (尝试 {} / {} 次)",
+                    attempt,
+                    max_attempts
+                );
+            }
+            _ => {
+                let message = json["data"]["message"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| json["message"].as_str().filter(|s| !s.is_empty()))
+                    .unwrap_or("未知错误");
+                return QrCodeLoginStatus::Failed(message.to_string());
             }
         }
-        Err(e) => {
-            log::error!("获取票token失败，错误信息：{}",e);
-            return Err(TokenRiskParam{
-                code: 999 as i32,
-                
-                message: e.to_string(),
-                
-                mid: None,
-                decision_type: None,
-                buvid: None,
-                ip: None,
-                scene: None,
-                ua: None,
-                v_voucher: None,
-                risk_param: None,
-            });
+
+        if attempt < max_attempts {
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {}
+                _ = wait_cancel_rx(&mut cancel_rx) => {
+                    return QrCodeLoginStatus::Failed("任务已取消".to_string());
+                }
+            }
         }
     }
 
+    QrCodeLoginStatus::Expired
 }
 
-pub async fn confirm_ticket_order(cookie_manager:Arc<CookieManager>,project_id : &str,token: &str) -> Result<ConfirmTicketResult, String> {
-    let url = format!("https://show.bilibili.com/api/ticket/order/confirmInfo?token={}&voucher=&project_id={}&requestSource=neul-next",token,project_id);
-    let response = cookie_manager.get(&url)
-        .await
-        .send()
-        .await
-        .map_err(|e| format!("请求失败: {}", e))?;
-        
-    if !response.status().is_success() {
-        return Err(format!("请求失败: {}", response.status()));
+// 可取消的二维码登录轮询（在首次检测到 86090 已扫码未确认时触发一次 on_scanning 回调）
+pub async fn poll_qrcode_login_with_progress(
+    qrcode_key: &str,
+    user_agent: Option<&str>,
+    cancel_rx: watch::Receiver<bool>,
+    on_scanning: impl FnMut(),
+) -> QrCodeLoginStatus {
+    poll_qrcode_login_with_config(
+        "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+        qrcode_key,
+        user_agent,
+        Duration::from_secs(1),
+        cancel_rx,
+        on_scanning,
+    )
+    .await
+}
+
+// 可取消的二维码登录轮询
+pub async fn poll_qrcode_login_cancellable(
+    qrcode_key: &str,
+    user_agent: Option<&str>,
+    cancel_rx: watch::Receiver<bool>,
+) -> QrCodeLoginStatus {
+    poll_qrcode_login_with_progress(qrcode_key, user_agent, cancel_rx, || {}).await
+}
+
+// 兼容无取消信号调用方的轮询入口
+pub async fn poll_qrcode_login(
+    qrcode_key: &str,
+    user_agent: Option<&str>,
+) -> QrCodeLoginStatus {
+    let (_tx, rx) = watch::channel(false);
+    poll_qrcode_login_cancellable(qrcode_key, user_agent, rx).await
+}
+
+pub(crate) fn build_token_risk_param(
+    code: i32,
+    message: String,
+    risk_params: &Value,
+) -> TokenRiskParam {
+    TokenRiskParam {
+        code,
+        message,
+        mid: Some(risk_params["mid"].as_str().unwrap_or("").to_string()),
+        decision_type: Some(
+            risk_params["decision_type"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        ),
+        buvid: Some(risk_params["buvid"].as_str().unwrap_or("").to_string()),
+        ip: Some(risk_params["ip"].as_str().unwrap_or("").to_string()),
+        scene: Some(risk_params["scene"].as_str().unwrap_or("").to_string()),
+        ua: Some(risk_params["ua"].as_str().unwrap_or("").to_string()),
+        v_voucher: Some(risk_params["v_voucher"].as_str().unwrap_or("").to_string()),
+        risk_param: if risk_params.is_null() {
+            None
+        } else {
+            Some(risk_params.clone())
+        },
     }
-    let text = response.text()
-        .await
-        .map_err(|e| format!("获取响应文本失败: {}", e))?;
-    log::debug!("确认订单响应：{}", text);
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("解析响应文本失败: {}", e))?;
-    if json["errno"]!=0 {
-        return Err(format!("确认订单失败: {}", json["msg"].as_str().unwrap_or("未知错误")));
+}
+
+pub(crate) fn parse_confirm_ticket_response(json: &Value) -> Result<ConfirmTicketResult, String> {
+    if let Some((err_code, msg)) = extract_api_error(json) {
+        return Err(format!("确认订单失败({}): {}", err_code, msg));
     }
-    let confirm_result = serde_json::from_value(json["data"].clone())
+
+    let Some(data) = json.get("data").filter(|d| d.is_object()) else {
+        return Err("确认订单响应缺少有效 data 对象".to_string());
+    };
+
+    let confirm_result: ConfirmTicketResult = serde_json::from_value(data.clone())
         .map_err(|e| format!("解析确认订单结果失败: {}", e))?;
+
+    if confirm_result.count <= 0 {
+        return Err(format!(
+            "确认订单数据不完整：购票数量无效 (count={})",
+            confirm_result.count
+        ));
+    }
+
     Ok(confirm_result)
 }
 
+fn simple_risk_err(code: i32, message: impl Into<String>) -> TokenRiskParam {
+    TokenRiskParam {
+        code,
+        message: message.into(),
+        mid: None,
+        decision_type: None,
+        buvid: None,
+        ip: None,
+        scene: None,
+        ua: None,
+        v_voucher: None,
+        risk_param: None,
+    }
+}
+
+pub async fn get_ticket_token(
+    cookie_manager: Arc<CookieManager>,
+    cpdd: Arc<Mutex<CTokenGenerator>>,
+    project_id: &str,
+    screen_id: &str,
+    ticket_id: &str,
+    count: i16,
+    is_hot: bool,
+) -> Result<(String, String), TokenRiskParam> {
+    let project_id_int = project_id
+        .parse::<i64>()
+        .map_err(|_| simple_risk_err(ERR_INVALID_PARAM, format!("无效的 project_id: {}", project_id)))?;
+    let screen_id_int = screen_id
+        .parse::<i64>()
+        .map_err(|_| simple_risk_err(ERR_INVALID_PARAM, format!("无效的 screen_id: {}", screen_id)))?;
+    let sku_id_int = ticket_id
+        .parse::<i64>()
+        .map_err(|_| simple_risk_err(ERR_INVALID_PARAM, format!("无效的 ticket_id: {}", ticket_id)))?;
+
+    let ctoken = if is_hot {
+        cpdd.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generate_ctoken(false)
+    } else {
+        String::new()
+    };
+
+    let params = json!({
+        "count": count,
+        "screen_id": screen_id_int,
+        "order_type": 1,
+        "project_id": project_id_int,
+        "sku_id": sku_id_int,
+        "token": ctoken,
+        "newRisk": true,
+        "requestSource": "neul-next",
+    });
+
+    log::debug!("获取票token参数：{:?}", params);
+    let base_url = "https://show.bilibili.com/api/ticket/order/prepare";
+    // 热门项目 prepare 走 HTTP/2（与 createV2 同一个 h2 客户端）
+    let req = if is_hot {
+        cookie_manager
+            .post_with_headers_h2(base_url, HashMap::new())
+            .await
+    } else {
+        cookie_manager.post(base_url).await
+    };
+
+    let resp = req
+        .query(&[("project_id", project_id)])
+        .json(&params)
+        .send()
+        .await
+        .map_err(|e| {
+            log::error!("获取票token网络请求失败，错误信息：{}", e);
+            simple_risk_err(ERR_NETWORK, e.to_string())
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        log::error!("获取票token失败，服务器不期待响应，状态码：{}", status);
+        return Err(simple_risk_err(status.as_u16() as i32, status.to_string()));
+    }
+
+    let json = resp.json::<Value>().await.map_err(|e| {
+        log::error!("解析票务token响应失败: {}", e);
+        simple_risk_err(ERR_PARSE, e.to_string())
+    })?;
+
+    log::debug!("获取票token响应：{}", json);
+
+    if let Some((code, msg)) = extract_api_error(&json) {
+        if code == -401 || code == 401 {
+            log::info!("需要进行人机验证");
+            let risk_params = &json["data"]["ga_data"]["riskParams"];
+            let token_risk_param = build_token_risk_param(code as i32, msg, risk_params);
+            log::debug!("{:?}", token_risk_param);
+            return Err(token_risk_param);
+        }
+
+        log::error!(
+            "获取token失败，错误码：{}，错误信息：{}",
+            code,
+            msg
+        );
+        log::debug!("获取token错误响应详情: {:?}", json);
+        return Err(simple_risk_err(code as i32, msg));
+    }
+
+    let token = json["data"]["token"].as_str().unwrap_or("").trim();
+    if token.is_empty() {
+        log::error!("获取token响应成功但 token 字段为空");
+        return Err(simple_risk_err(ERR_PARSE, "接口返回空 token"));
+    }
+
+    if is_hot {
+        let ptoken = json["data"]["ptoken"].as_str().unwrap_or("");
+        Ok((token.to_string(), ptoken.to_string()))
+    } else {
+        Ok((token.to_string(), String::new()))
+    }
+}
+
+pub async fn confirm_ticket_order(
+    cookie_manager: Arc<CookieManager>,
+    project_id: &str,
+    token: &str,
+) -> Result<ConfirmTicketResult, String> {
+    let response = cookie_manager
+        .get("https://show.bilibili.com/api/ticket/order/confirmInfo")
+        .await
+        .query(&[
+            ("token", token),
+            ("voucher", ""),
+            ("project_id", project_id),
+            ("requestSource", "neul-next"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("请求失败: {}", response.status()));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("获取响应文本失败: {}", e))?;
+    log::debug!("确认订单响应：{}", text);
+
+    let json: Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析响应文本失败: {}", e))?;
+
+    parse_confirm_ticket_response(&json)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_create_order_payload(
+    project_id: &str,
+    screen_id: &str,
+    ticket_id: Option<&str>,
+    token: &str,
+    ptoken_clean: &str,
+    ctoken: Option<String>,
+    is_hot: bool,
+    id_bind: usize,
+    no_bind_buyer_info: Option<&NoBindBuyerInfo>,
+    buyer_info: &[BuyerInfo],
+    click_position: Value,
+    is_mobile: bool,
+    device_id: &str,
+    pay_money: i64,
+    count: i32,
+    timestamp: u64,
+) -> Result<Value, i32> {
+    let project_id_int = project_id.parse::<i64>().map_err(|_| ERR_INVALID_PARAM)?;
+    let screen_id_int = screen_id.parse::<i64>().map_err(|_| ERR_INVALID_PARAM)?;
+    let ticket_id_str = ticket_id.ok_or(ERR_INVALID_PARAM)?;
+    let ticket_id_int = ticket_id_str.parse::<i64>().map_err(|_| ERR_INVALID_PARAM)?;
+    let request_source = if is_mobile { "neul-next" } else { "pc-new" };
+
+    match id_bind {
+        0 => {
+            let no_bind = match no_bind_buyer_info {
+                Some(info) => info,
+                None => {
+                    log::error!("非实名购票人信息缺失，无法下单");
+                    return Err(ERR_INVALID_PARAM);
+                }
+            };
+            let mut body = json!({
+                "project_id": project_id_int,
+                "screen_id": screen_id_int,
+                "sku_id": ticket_id_int,
+                "token": token,
+                "buyer": no_bind.name,
+                "tel": no_bind.tel,
+                "clickPosition": click_position,
+                "newRisk": true,
+                "requestSource": request_source,
+                "deviceId": device_id,
+                "pay_money": pay_money,
+                "count": count,
+                "timestamp": timestamp,
+                "order_type": 1,
+            });
+            if is_hot {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("ctoken".to_string(), json!(ctoken.unwrap_or_default()));
+                    obj.insert("ptoken".to_string(), json!(ptoken_clean));
+                }
+            }
+            Ok(body)
+        }
+        1 | 2 => {
+            let mut body = json!({
+                "project_id": project_id_int,
+                "screen_id": screen_id_int,
+                "sku_id": ticket_id_int,
+                "token": token,
+                "buyer_info": serde_json::to_string(buyer_info).unwrap_or_default(),
+                "clickPosition": click_position,
+                "newRisk": true,
+                "requestSource": request_source,
+                "deviceId": device_id,
+                "pay_money": pay_money,
+                "count": count,
+                "timestamp": timestamp,
+                "order_type": 1,
+            });
+            if is_hot {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("ctoken".to_string(), json!(ctoken.unwrap_or_default()));
+                    obj.insert("ptoken".to_string(), json!(ptoken_clean));
+                }
+            }
+            Ok(body)
+        }
+        _ => {
+            log::error!("购票人信息错误，id_bind: {}", id_bind);
+            Err(ERR_ID_BIND_INVALID)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn create_order(
     cookie_manager: Arc<CookieManager>,
     cpdd: Arc<Mutex<CTokenGenerator>>,
@@ -532,17 +1059,11 @@ pub async fn create_order(
     is_mobile: bool,
     need_retry: bool,
     fast_mode: bool,
-    screen_size: Option<(u32, u32)> // 可选参数：(宽度,高度)
+    screen_size: Option<(u32, u32)>,
 ) -> Result<Value, i32> {
-    
-    let ptoken = ptoken.replace('=', "");
-    let url = if !is_hot {
-        format!("https://show.bilibili.com/api/ticket/order/createV2?project_id={}", project_id)
-    }else{
-        format!("https://show.bilibili.com/api/ticket/order/createV2?project_id={}&ptoken={}", project_id, ptoken)
-    };
-    
-    // 选择适当的位置类型
+    let ptoken_clean = ptoken.replace('=', "");
+    let base_url = "https://show.bilibili.com/api/ticket/order/createV2";
+
     let position_type = if need_retry && is_mobile {
         ClickPositionType::RetryButton
     } else if is_mobile {
@@ -550,175 +1071,140 @@ pub async fn create_order(
     } else {
         ClickPositionType::PcConfirm
     };
-    
-    let risk_header = format!("platform/{} uid/{} deviceId/{}"
-    ,"h5"
-    ,cookie_manager.get_cookie("DedeUserID").unwrap_or("".to_string())
-    ,cookie_manager.get_cookie("buvid3").unwrap_or("".to_string())
+
+    let risk_header = format!(
+        "platform/{} uid/{} deviceId/{}",
+        "h5",
+        cookie_manager.get_cookie("DedeUserID").unwrap_or_default(),
+        cookie_manager.get_cookie("buvid3").unwrap_or_default(),
     );
     let mut input_risk_header = HashMap::new();
     input_risk_header.insert("X-Risk-Header", risk_header.as_str());
-    
-    // 提取屏幕尺寸（如果提供）
+
     let (width, height) = screen_size.unwrap_or((1080, 2400));
-    
-    // 生成点击位置
-    let click_position = random_click_position(
-        position_type,
-        fast_mode,
-        Some(width),
-        Some(height)
-    ).await;
+    let click_position = random_click_position(position_type, fast_mode, Some(width), Some(height));
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let count = confirm_result.count.clone();
-    let pay_money = confirm_result.pay_money.clone();
-
-    let ticket_id = match biliticket.select_ticket_id.clone() {
-        Some(id) => id,
-        None => return Err(999), 
-    };
-    let ticket_id_int = ticket_id.parse::<i64>().map_err(|_| 999)?;
-
-    
-    let data = match biliticket.id_bind {
-        0 => {
-            // 不实名制购票人信息
-            let no_bind_buyer_info = match biliticket.no_bind_buyer_info.clone() {
-                Some(info) => info,
-                None => {
-                    log::error!("非实名购票人信息缺失，无法下单");
-                    return Err(999);
-                }
-            };
-                
-            let data = json!({
-                "project_id": project_id.parse::<i64>().unwrap_or(0),
-                "screen_id": biliticket.screen_id.parse::<i64>().unwrap_or(0),
-                "sku_id": ticket_id_int, 
-                "token": token,
-                "buyer": no_bind_buyer_info.name,
-                "tel": no_bind_buyer_info.tel,
-                "clickPosition": click_position,
-                "newRisk": true,
-                "requestSource": if is_mobile { "neul-next" } else { "pc-new" }, 
-                "deviceId": cookie_manager.get_cookie("deviceFingerprint"),
-                "pay_money": pay_money,
-                "count": count,
-                "timestamp": timestamp,
-                "order_type": 1, 
-            });
-            data
-        }
-        1 | 2 => {
-            let data = if is_hot {
-                json!({
-                    "project_id": project_id.parse::<i64>().unwrap_or(0),
-                    "screen_id": biliticket.screen_id.parse::<i64>().unwrap_or(0),
-                    "sku_id": ticket_id_int,
-                    "token": token,
-                    "ctoken": cpdd.lock().unwrap().generate_ctoken(true),
-                    "ptoken":ptoken,
-                    "buyer_info": serde_json::to_string(buyer_info).unwrap_or_default(),
-                    "clickPosition": click_position,
-                    "newRisk": true,
-                    "requestSource": if is_mobile { "neul-next" } else { "pc-new" }, 
-                    "deviceId": cookie_manager.get_cookie("deviceFingerprint"),
-                    "pay_money": pay_money,
-                    "count": count,
-                    "timestamp": timestamp,
-                    "order_type": 1,
-                })
-            }else{
-                json!({
-                    "project_id": project_id.parse::<i64>().unwrap_or(0),
-                    "screen_id": biliticket.screen_id.parse::<i64>().unwrap_or(0),
-                    "sku_id": ticket_id_int, 
-                    "token": token,
-                    "buyer_info": serde_json::to_string(buyer_info).unwrap_or_default(),
-                    "clickPosition": click_position,
-                    "newRisk": true,
-                    "requestSource": if is_mobile { "neul-next" } else { "pc-new" }, 
-                    "deviceId": cookie_manager.get_cookie("deviceFingerprint"),
-                    "pay_money": pay_money,
-                    "count": count,
-                    "timestamp": timestamp,
-                    "order_type": 1, 
-                })
-            };
-            data
-        }
-        _ => {
-            log::error!("购票人信息错误，id_bind: {}", biliticket.id_bind);
-            return Err(919); // 错误的购票人信息
-        }
+    let ctoken = if is_hot {
+        Some(
+            cpdd.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .generate_ctoken(true),
+        )
+    } else {
+        None
     };
 
-    log::debug!("抢票data ：{:?}", data);
-    let response = cookie_manager.post_with_headers_h2(&url, input_risk_header).await
-        .json(&data)
-        .send()
-        .await
-        .map_err(|e| {
-            log::error!("请求失败: {}", e);
-            412
-        })?;
+    let device_id = cookie_manager
+        .get_cookie("deviceFingerprint")
+        .unwrap_or_default();
+
+    let data = build_create_order_payload(
+        project_id,
+        &biliticket.screen_id,
+        biliticket.select_ticket_id.as_deref(),
+        token,
+        &ptoken_clean,
+        ctoken,
+        is_hot,
+        biliticket.id_bind,
+        biliticket.no_bind_buyer_info.as_ref(),
+        buyer_info,
+        click_position,
+        is_mobile,
+        &device_id,
+        confirm_result.pay_money,
+        confirm_result.count,
+        timestamp,
+    )?;
+
+    log::debug!("抢票data：{:?}", data);
+
+    let req = cookie_manager
+        .post_with_headers_h2(base_url, input_risk_header)
+        .await;
+    let req = if is_hot {
+        req.query(&[("project_id", project_id), ("ptoken", ptoken_clean.as_str())])
+    } else {
+        req.query(&[("project_id", project_id)])
+    };
+
+    let response = req.json(&data).send().await.map_err(|e| {
+        log::error!("createV2 网络请求失败: {}", e);
+        ERR_NETWORK
+    })?;
+
     log::debug!("createV2 实际协议版本: {:?}", response.version());
     if response.status() != 200 {
-        log::error!("请求失败: {}", response.status());
+        log::error!("createV2 HTTP 失败: {}", response.status());
         return Err(response.status().as_u16() as i32);
-    };
-    let text = response
-        .text()
-        .await
-        .map_err(|e| {
-            log::error!("获取响应文本失败: {}", e);
-            412
-        })?;
-    log::info!("{}",text);
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|e| {
-            log::error!("解析响应文本失败: {}", e);
-            412
-        })?;
-    
-    let errno_value = value.get("errno").and_then(|v| v.as_i64()).unwrap_or(-1);
-    let code_value = value.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    
-    // 只要有一个错误码不是0，就认为有错误
-    if (errno_value != 0 && errno_value != -1) || (errno_value == -1 && code_value != 0) {
-        return Err(if errno_value != -1 { 
-            errno_value as i32 
-        } else { 
-            code_value as i32 
-        });
     }
-    
-    Ok(value)
-}    
 
-pub async fn check_fake_ticket(cookie_manager: Arc<CookieManager>, project_id: &str, pay_token: &str, order_id: i64) -> Result<Value,String>{
+    let text = response.text().await.map_err(|e| {
+        log::error!("createV2 获取响应文本失败: {}", e);
+        ERR_NETWORK
+    })?;
+    log::debug!("createV2 原始响应: {}", text);
+
+    let value: Value = serde_json::from_str(&text).map_err(|e| {
+        log::error!("createV2 解析响应文本失败: {}", e);
+        ERR_PARSE
+    })?;
+
+    if let Some((err_code, msg)) = extract_api_error(&value) {
+        log::debug!("createV2 返回错误码({}): {}", err_code, msg);
+        return Err(err_code as i32);
+    }
+
+    Ok(value)
+}
+
+pub async fn check_fake_ticket(
+    cookie_manager: Arc<CookieManager>,
+    project_id: &str,
+    pay_token: &str,
+    order_id: &str,
+) -> Result<Value, String> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as u32;
-    let mut url = format!("https://show.bilibili.com/api/ticket/order/createstatus?project_id={}&token={}&timestamp={}",project_id, pay_token, timestamp);
-    if order_id != 0{
-        url = format!("{}&orderId={}",url, order_id);
-    } 
-    log::debug!("check_fake_ticket_url: {}", url);
-    let response = cookie_manager.get(&url)
+        .as_secs();
+    let timestamp_str = timestamp.to_string();
+
+    let mut query_params: Vec<(&str, &str)> = vec![
+        ("project_id", project_id),
+        ("token", pay_token),
+        ("timestamp", timestamp_str.as_str()),
+    ];
+    let trimmed_order_id = order_id.trim();
+    if !trimmed_order_id.is_empty() && trimmed_order_id != "0" {
+        query_params.push(("orderId", trimmed_order_id));
+    }
+
+    let response = cookie_manager
+        .get("https://show.bilibili.com/api/ticket/order/createstatus")
         .await
+        .query(&query_params)
         .send()
         .await
         .map_err(|e| format!("请求失败: {}", e))?;
-    log::debug!("check_fake_ticket: {:?}", response);
-    let data = serde_json::from_str::<Value>(&response.text().await.unwrap_or_default())
-        .map_err(|e| format!("解析响应文本失败: {}", e))?;
+
+    log::debug!("check_fake_ticket status: {:?}", response.status());
+    if !response.status().is_success() {
+        return Err(format!("检测订单状态返回 HTTP {}", response.status()));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("读取检测响应文本失败: {}", e))?;
+
+    let data =
+        serde_json::from_str::<Value>(&text).map_err(|e| format!("解析响应文本失败: {}", e))?;
     Ok(data)
 }
 
@@ -733,84 +1219,54 @@ pub enum ClickPositionType {
     RetryButton,
 }
 
-
-/// 生成随机点击位置
-/// 
-/// # 参数
-/// * `position_type` - 位置类型：PC/手机/重试按钮
-/// * `fast_mode` - 时间间隔模式：true为快模式(0.8-4.6秒)，false为慢模式(4-12秒)
-/// * `screen_width` - (可选)手机屏幕宽度，用于计算比例坐标，默认1080
-/// * `screen_height` - (可选)手机屏幕高度，用于计算比例坐标，默认2400
-/// 
-pub async fn random_click_position(
-    position_type: ClickPositionType, 
+fn random_click_position_with_now(
+    position_type: ClickPositionType,
     fast_mode: bool,
     screen_width: Option<u32>,
-    screen_height: Option<u32>
+    screen_height: Option<u32>,
+    now: u64,
 ) -> Value {
     let mut rng = thread_rng();
-    
-    // 获取手机屏幕尺寸（默认使用常见尺寸1080x2400）
+
     let mobile_width = screen_width.unwrap_or(1080);
     let mobile_height = screen_height.unwrap_or(2400);
-    
-    // 根据不同设备/按钮类型确定基准坐标和偏移范围
+
     let (base_x, base_y, offset_range) = match position_type {
-        ClickPositionType::PcConfirm => {
-            // PC端确认下单按钮位置(右侧中下部)
-            (1131, 636, 10)
-        },
+        ClickPositionType::PcConfirm => (1131, 636, 10),
         ClickPositionType::MobileConfirm => {
-            // 手机端确认下单按钮位置(右下角)
-            // 使用比例计算：x在屏幕宽度的0.55-0.9之间，y在屏幕底部附近
             let x_ratio = rng.gen_range(0.55..0.9);
             let y_ratio = rng.gen_range(0.9..0.95);
-            
+
             let x = (mobile_width as f32 * x_ratio) as i32;
             let y = (mobile_height as f32 * y_ratio) as i32;
-            
-            (x, y, mobile_width.min(20) as i32 / 4) // 偏移范围根据屏幕宽度按比例缩放
-        },
+
+            (x, y, (mobile_width as i32 / 4).clamp(1, 20))
+        }
         ClickPositionType::RetryButton => {
-            // 手机版"再试一次"按钮位置(屏幕中间靠下)
-            // x坐标在屏幕宽度的1/3到2/3之间，y坐标在屏幕高度的2/3左右
-            let x_ratio = rng.gen_range(0.33..0.67); // 屏幕宽度的2/6到4/6之间
-            let y_ratio = rng.gen_range(0.6..0.7);   // 屏幕高度的2/3左右
-            
+            let x_ratio = rng.gen_range(0.33..0.67);
+            let y_ratio = rng.gen_range(0.6..0.7);
+
             let x = (mobile_width as f32 * x_ratio) as i32;
             let y = (mobile_height as f32 * y_ratio) as i32;
-            
-            (x, y, mobile_width.min(30) as i32 / 4) // 偏移较大，因为这是个大按钮
+
+            (x, y, (mobile_width as i32 / 4).clamp(1, 30))
         }
     };
-    
-    // 生成随机偏移
+
     let offset_x = rng.gen_range(-offset_range..=offset_range);
     let offset_y = rng.gen_range(-offset_range..=offset_range);
-    
-    // 计算最终坐标
+
     let final_x = base_x + offset_x;
     let final_y = base_y + offset_y;
-    
-    // 获取当前时间戳
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    
-    // 根据模式生成不同的延迟时间
-    let random_delay = if fast_mode {
-        // 快模式：0.8-4.6秒
+
+    let random_delay: u64 = if fast_mode {
         rng.gen_range(800..4600)
     } else {
-        // 慢模式：4-12秒
         rng.gen_range(4000..12000)
     };
-    
-    // 计算起始时间
-    let origin = now - random_delay;
-    
-    // 构建JSON对象
+
+    let origin = now.saturating_sub(random_delay);
+
     json!({
         "x": final_x,
         "y": final_y,
@@ -819,6 +1275,19 @@ pub async fn random_click_position(
     })
 }
 
+/// 生成随机点击位置
+pub fn random_click_position(
+    position_type: ClickPositionType,
+    fast_mode: bool,
+    screen_width: Option<u32>,
+    screen_height: Option<u32>,
+) -> Value {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    random_click_position_with_now(position_type, fast_mode, screen_width, screen_height, now)
+}
 
 fn extract_qrcode_poll_code(json: &Value) -> i64 {
     json["data"]["code"]
@@ -853,6 +1322,12 @@ mod tests {
         });
         assert_eq!(extract_qrcode_poll_code(&scanned), 86090);
 
+        let expired = json!({
+            "code": 0,
+            "data": { "code": 86038, "message": "二维码已失效" }
+        });
+        assert_eq!(extract_qrcode_poll_code(&expired), 86038);
+
         let success = json!({
             "code": 0,
             "data": { "code": 0, "message": "" }
@@ -864,5 +1339,360 @@ mod tests {
             "message": "请求错误"
         });
         assert_eq!(extract_qrcode_poll_code(&api_err), -400);
+
+        let missing = json!({ "code": 0, "data": {} });
+        assert_eq!(extract_qrcode_poll_code(&missing), -1);
+    }
+
+    #[test]
+    fn extract_api_error_distinguishes_minus_one_and_missing_fields() {
+        // errno: -1 with code: 0 must fail (never treat -1 as missing!)
+        let err1 = json!({ "errno": -1, "code": 0, "msg": "系统错误" });
+        assert_eq!(
+            extract_api_error(&err1),
+            Some((-1, "系统错误".to_string()))
+        );
+
+        // errno: 0 with code: -400 must fail
+        let err2 = json!({ "errno": 0, "code": -400, "message": "参数错误" });
+        assert_eq!(
+            extract_api_error(&err2),
+            Some((-400, "参数错误".to_string()))
+        );
+
+        // errno: 0 with absent code succeeds
+        let ok1 = json!({ "errno": 0, "data": {} });
+        assert_eq!(extract_api_error(&ok1), None);
+
+        // code: 0 with absent errno succeeds
+        let ok2 = json!({ "code": 0, "data": {} });
+        assert_eq!(extract_api_error(&ok2), None);
+
+        // both absent must fail
+        let both_missing = json!({ "data": { "message": "缺少状态码" } });
+        assert_eq!(
+            extract_api_error(&both_missing),
+            Some((-1, "缺少状态码".to_string()))
+        );
+
+        // empty object falls back to default message
+        assert_eq!(
+            extract_api_error(&json!({})),
+            Some((-1, "未知错误".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_order_id_handles_i64_u64_string_and_missing() {
+        // i64
+        let from_i64 = json!({ "data": { "orderId": 12345678901234i64 } });
+        assert_eq!(
+            extract_order_id(&from_i64),
+            Some("12345678901234".to_string())
+        );
+
+        // u64 larger than i64::MAX
+        let big_u64: u64 = (i64::MAX as u64) + 12345;
+        let from_u64 = json!({ "data": { "orderId": big_u64 } });
+        assert_eq!(extract_order_id(&from_u64), Some(big_u64.to_string()));
+
+        // large snowflake string
+        let from_str = json!({ "data": { "orderId": "9988776655443322110099" } });
+        assert_eq!(
+            extract_order_id(&from_str),
+            Some("9988776655443322110099".to_string())
+        );
+
+        // missing or zero
+        assert_eq!(extract_order_id(&json!({ "data": {} })), None);
+        assert_eq!(extract_order_id(&json!({ "data": { "orderId": 0 } })), None);
+        assert_eq!(
+            extract_order_id(&json!({ "data": { "orderId": "" } })),
+            None
+        );
+    }
+
+    #[test]
+    fn create_order_payload_includes_ctoken_ptoken_for_id_bind_0_hot_project() {
+        let no_bind = NoBindBuyerInfo {
+            name: "张三".to_string(),
+            tel: "13800138000".to_string(),
+            uid: 10001,
+        };
+        let payload = build_create_order_payload(
+            "10001",
+            "20002",
+            Some("30003"),
+            "tok_abc",
+            "ptok_clean",
+            Some("ctok_xyz".to_string()),
+            true,
+            0,
+            Some(&no_bind),
+            &[],
+            json!({"x": 100, "y": 200, "origin": 1000, "now": 2000}),
+            true,
+            "",
+            9900,
+            1,
+            1700000000000,
+        )
+        .expect("id_bind=0 + is_hot=true should build payload");
+
+        assert_eq!(payload["project_id"], json!(10001));
+        assert_eq!(payload["screen_id"], json!(20002));
+        assert_eq!(payload["sku_id"], json!(30003));
+        assert_eq!(payload["ctoken"], json!("ctok_xyz"));
+        assert_eq!(payload["ptoken"], json!("ptok_clean"));
+        assert_eq!(payload["buyer"], json!("张三"));
+        assert_eq!(payload["tel"], json!("13800138000"));
+        assert_eq!(payload["deviceId"], json!(""));
+
+        // non-hot id_bind=0 should omit ctoken/ptoken
+        let cold_payload = build_create_order_payload(
+            "10001",
+            "20002",
+            Some("30003"),
+            "tok_abc",
+            "",
+            None,
+            false,
+            0,
+            Some(&no_bind),
+            &[],
+            json!({"x": 100, "y": 200, "origin": 1000, "now": 2000}),
+            false,
+            "fp123",
+            9900,
+            1,
+            1700000000000,
+        )
+        .expect("cold id_bind=0 should build");
+        assert!(cold_payload.get("ctoken").is_none());
+        assert!(cold_payload.get("ptoken").is_none());
+        assert_eq!(cold_payload["requestSource"], json!("pc-new"));
+
+        // invalid numeric IDs fail fast with ERR_INVALID_PARAM (999)
+        let bad = build_create_order_payload(
+            "not_a_num",
+            "20002",
+            Some("30003"),
+            "tok",
+            "",
+            None,
+            false,
+            0,
+            Some(&no_bind),
+            &[],
+            json!({}),
+            true,
+            "",
+            9900,
+            1,
+            1700000000000,
+        );
+        assert_eq!(bad, Err(ERR_INVALID_PARAM));
+    }
+
+    #[test]
+    fn cache_path_sanitizes_traversal_and_special_chars() {
+        let p = cache_path("../../etc/passwd");
+        assert_eq!(p, PathBuf::from("cache").join("project_etcpasswd.json"));
+
+        let p2 = cache_path("12345_abc-9");
+        assert_eq!(p2, PathBuf::from("cache").join("project_12345_abc-9.json"));
+
+        let p3 = cache_path("../../../");
+        assert_eq!(p3, PathBuf::from("cache").join("project_unknown.json"));
+    }
+
+    #[test]
+    fn random_click_position_does_not_underflow_and_handles_small_screens() {
+        // now < delay must saturate to 0 rather than panic with u64 underflow
+        let pos = random_click_position_with_now(
+            ClickPositionType::MobileConfirm,
+            false,
+            Some(0),
+            Some(0),
+            100,
+        );
+        assert_eq!(pos["origin"], json!(0));
+        assert_eq!(pos["now"], json!(100));
+
+        let retry_pos = random_click_position_with_now(
+            ClickPositionType::RetryButton,
+            true,
+            Some(1080),
+            Some(2400),
+            500,
+        );
+        assert_eq!(retry_pos["origin"], json!(0));
+
+        // Normal timestamp produces origin <= now
+        let normal = random_click_position(ClickPositionType::PcConfirm, true, None, None);
+        let origin = normal["origin"].as_u64().unwrap();
+        let now = normal["now"].as_u64().unwrap();
+        assert!(origin <= now);
+    }
+
+    #[tokio::test]
+    async fn poll_qrcode_login_cancellable_exits_immediately_when_cancelled() {
+        let (_tx, rx) = watch::channel(true);
+        let status = poll_qrcode_login_cancellable("dummy_key", Some("   "), rx).await;
+        assert!(matches!(status, QrCodeLoginStatus::Failed(_)));
+    }
+
+    #[test]
+    fn parse_confirm_ticket_response_rejects_null_and_empty_data() {
+        assert!(parse_confirm_ticket_response(&json!({"errno": 0, "data": null})).is_err());
+        assert!(parse_confirm_ticket_response(&json!({"errno": 0, "data": {}})).is_err());
+        assert!(
+            parse_confirm_ticket_response(&json!({"errno": 0, "data": {"count": 0, "pay_money": 9900}}))
+                .is_err()
+        );
+        assert!(
+            parse_confirm_ticket_response(&json!({"errno": 100001, "msg": "限流", "data": {"count": 1}}))
+                .is_err()
+        );
+
+        let ok = parse_confirm_ticket_response(&json!({
+            "errno": 0,
+            "data": {
+                "count": 2,
+                "pay_money": 19800,
+                "project_name": "测试漫展",
+                "screen_name": "5月1日",
+                "ticket_info": {
+                    "name": "普通票",
+                    "count": 2,
+                    "price": 9900
+                }
+            }
+        }))
+        .expect("valid confirm response should succeed");
+        assert_eq!(ok.count, 2);
+        assert_eq!(ok.pay_money, 19800);
+    }
+
+    #[test]
+    fn project_cache_validation_rejects_incomplete_cached_json() {
+        let missing_id_bind = r#"{
+            "errno": 0,
+            "data": {
+                "id": 10001,
+                "name": "Incomplete Show",
+                "sale_begin": 1780000000,
+                "screen_list": [{"id": 1, "clickable": true}]
+            }
+        }"#;
+        assert!(parse_and_validate_project_cache(missing_id_bind).is_err());
+
+        let valid_cache = r#"{
+            "errno": 0,
+            "data": {
+                "id": 10001,
+                "name": "Complete Show",
+                "id_bind": 2,
+                "sale_flag_number": 8,
+                "sale_begin": null,
+                "screen_list": [{"id": 1, "clickable": false, "sale_start": 0, "sale_flag_number": 8}]
+            }
+        }"#;
+        let parsed =
+            parse_and_validate_project_cache(valid_cache).expect("valid cache should pass");
+        assert_eq!(parsed.data.id, Some(10001));
+    }
+
+    #[test]
+    fn parse_server_now_response_requires_positive_timestamp() {
+        assert_eq!(
+            parse_server_now_response(r#"{"code":0,"data":{"now":1776079512}}"#).unwrap(),
+            1776079512
+        );
+        assert!(parse_server_now_response(r#"{"code":0,"data":{"now":0}}"#).is_err());
+        assert!(parse_server_now_response(r#"{"code":0,"data":{}}"#).is_err());
+        assert!(parse_server_now_response("not json").is_err());
+    }
+
+    #[test]
+    fn build_token_risk_param_never_wraps_json_null() {
+        let null_param = build_token_risk_param(-401, "need risk".to_string(), &Value::Null);
+        assert!(null_param.risk_param.is_none());
+
+        let obj_val = json!({"v_voucher": "voucher_123", "mid": "42"});
+        let valid_param = build_token_risk_param(-401, "need risk".to_string(), &obj_val);
+        assert_eq!(valid_param.risk_param, Some(obj_val));
+        assert_eq!(valid_param.v_voucher.as_deref(), Some("voucher_123"));
+    }
+
+    #[tokio::test]
+    async fn poll_qrcode_login_with_progress_emits_scanning_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local mock qr server");
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let responses = [
+                (
+                    r#"{"code":0,"data":{"code":86101,"message":"未扫码"}}"#,
+                    None,
+                ),
+                (
+                    r#"{"code":0,"data":{"code":86090,"message":"已扫码未确认"}}"#,
+                    None,
+                ),
+                (
+                    r#"{"code":0,"data":{"code":86090,"message":"已扫码未确认"}}"#,
+                    None,
+                ),
+                (
+                    r#"{"code":0,"data":{"code":0,"message":""}}"#,
+                    Some("SESSDATA=qr_ok_cookie; Path=/"),
+                ),
+            ];
+            for (body, set_cookie) in responses {
+                let (mut sock, _) = listener.accept().await.expect("accept poll request");
+                let mut req_buf = [0u8; 1024];
+                let _ = sock.read(&mut req_buf).await;
+                let cookie_hdr = match set_cookie {
+                    Some(c) => format!("Set-Cookie: {}\r\n", c),
+                    None => String::new(),
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    cookie_hdr,
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let (_tx, rx) = watch::channel(false);
+        let mut scan_notifications = 0usize;
+        let url = format!("http://{}/poll", addr);
+        let status = poll_qrcode_login_with_config(
+            &url,
+            "mock_key",
+            None,
+            Duration::from_millis(10),
+            rx,
+            || {
+                scan_notifications += 1;
+            },
+        )
+        .await;
+
+        server.await.unwrap();
+        assert_eq!(scan_notifications, 1, "on_scanning should fire exactly once");
+        assert_eq!(
+            status,
+            QrCodeLoginStatus::Success("SESSDATA=qr_ok_cookie".to_string())
+        );
     }
 }

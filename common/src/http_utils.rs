@@ -1,157 +1,92 @@
-use reqwest::{Client, header, Response, Error};
-use rand::seq::SliceRandom;
-use rand::thread_rng;
-use std::collections::HashMap;
-use serde_json;
-
-// 随机UA生成
-
-pub fn get_random_ua() -> String {
-    let ua_list = [
-        "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/98.0.4758.101",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 15_4 like Mac OS X) AppleWebKit/605.1.15",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/99.0.4844.51",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
-        "Mozilla/5.0 (Linux; Android 12; SM-S908B) Chrome/101.0.4951.41",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/102.0.0.0"
-    ];
-    
-    let mut rng = thread_rng();
-    ua_list.choose(&mut rng).unwrap_or(&ua_list[0]).to_string()
-}
-
+use reqwest::{header, Client, Error, Response};
+use serde_json::Value;
 
 pub async fn request_get(client: &Client, url: &str, cookie: Option<&str>) -> Result<Response, Error> {
-    
-    
     let mut req = client.get(url);
-        
-    
+
     if let Some(cookie_str) = cookie {
         req = req.header(header::COOKIE, cookie_str);
     }
-    
+
     req.send().await
+}
+
+pub(crate) fn json_value_to_form(value: &Value) -> Option<Vec<(String, String)>> {
+    let obj = value.as_object()?;
+    let mut form = Vec::with_capacity(obj.len());
+
+    for (key, val) in obj {
+        match val {
+            Value::String(s) => form.push((key.clone(), s.clone())),
+            Value::Number(n) => form.push((key.clone(), n.to_string())),
+            Value::Bool(b) => form.push((key.clone(), b.to_string())),
+            Value::Null => continue,
+            Value::Array(_) | Value::Object(_) => match serde_json::to_string(val) {
+                Ok(serialized) => form.push((key.clone(), serialized)),
+                Err(e) => log::warn!("表单字段 {} 序列化失败: {}", key, e),
+            },
+        }
+    }
+
+    Some(form)
 }
 
 pub async fn request_post<T: serde::Serialize + ?Sized>(
-    client: &Client, 
-    url: &str, 
-    
+    client: &Client,
+    url: &str,
     cookie: Option<&str>,
-    json_data: Option<&T>
+    json_data: Option<&T>,
 ) -> Result<Response, Error> {
-    
-    
     let mut req = client.post(url);
-        
+
     if let Some(cookie_str) = cookie {
         req = req.header(header::COOKIE, cookie_str);
     }
-    
+
     if let Some(data) = json_data {
-        if let Ok(json_value) = serde_json::to_value(data) {
-            if let Some(obj) = json_value.as_object() {
-                let mut form = std::collections::HashMap::new();
-                for (key, value) in obj {
-                    // 转换所有值为字符串
-                    form.insert(key, value.to_string().trim_matches('"').to_string());
+        match serde_json::to_value(data) {
+            Ok(json_value) => {
+                if let Some(form) = json_value_to_form(&json_value) {
+                    req = req.form(&form);
+                } else {
+                    log::warn!("request_post 收到非 JSON 对象载荷，已跳过表单编码");
                 }
-                req = req.form(&form);
+            }
+            Err(e) => {
+                log::warn!("request_post 序列化请求参数失败: {}", e);
             }
         }
     }
-    
+
     req.send().await
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-pub fn request_get_sync(client: &Client, url: &str, ua: Option<String>, cookie: Option<&str>) -> Result<Response, Error> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(request_get(client, url,  cookie))
-    
-}
+    #[test]
+    fn json_value_to_form_handles_types_without_corruption() {
+        let payload = json!({
+            "code": "012345",
+            "quoted": "\"hello\"",
+            "cid": 86,
+            "flag": true,
+            "ignored": null,
+            "nested": {"a": 1},
+            "arr": [1, 2]
+        });
 
-pub fn request_post_sync(client: &Client, url: &str, ua: Option<String>, cookie: Option<&str>, json_data: Option<&serde_json::Value>) -> Result<Response, Error> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(request_post(client, url, cookie, json_data))
-    
-}
+        let pairs = json_value_to_form(&payload).expect("should convert object");
+        let map: std::collections::HashMap<_, _> = pairs.into_iter().collect();
 
-pub fn request_form_sync(
-    client: &Client, 
-    url: &str,
-    ua: Option<String>,
-    cookie: Option<&str>,
-    form_data: &HashMap<String, String>
-) -> Result<Response, Error> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    
-    rt.block_on(async {
-        let mut req = client.post(url);
-        
-        if let Some(cookie_str) = cookie {
-            req = req.header(header::COOKIE, cookie_str);
-        }
-
-        if let Some(ua_str) = ua {
-            req = req.header(header::USER_AGENT, ua_str);
-        }
-        
-        req = req.form(&form_data);
-        req.send().await
-    })
-}
-
-
-pub fn request_json_form_sync(
-    client: &Client, 
-    url: &str,
-    ua: Option<String>,
-    referer: Option<String>,
-    cookie: Option<&str>,
-    json_form: &serde_json::Map<String, serde_json::Value>
-) -> Result<Response, Error> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    
-    rt.block_on(async {
-        let mut req = client.post(url);
-        
-        if let Some(cookie_str) = cookie {
-            req = req.header(header::COOKIE, cookie_str);
-        }
-
-        if let Some(ua_str) = ua {
-            req = req.header(header::USER_AGENT, ua_str);
-        }
-        
-        if let Some(referer_str) = referer {
-            req = req.header(header::REFERER, referer_str);
-        }
-        // 创建一个特殊的表单，保留数字类型
-        let mut form = std::collections::HashMap::new();
-        for (key, value) in json_form {
-            match value {
-                // 字符串类型
-                serde_json::Value::String(s) => {
-                    form.insert(key.clone(), s.clone());
-                },
-                // 数字类型 - 直接转为字符串但不加引号
-                serde_json::Value::Number(n) => {
-                    form.insert(key.clone(), n.to_string());
-                },
-                // 布尔类型
-                serde_json::Value::Bool(b) => {
-                    form.insert(key.clone(), b.to_string());
-                },
-                // 其他类型
-                _ => {
-                    form.insert(key.clone(), value.to_string().trim_matches('"').to_string());
-                }
-            }
-        }
-        
-        req = req.form(&form);
-        req.send().await
-    })
+        assert_eq!(map.get("code").map(String::as_str), Some("012345"));
+        assert_eq!(map.get("quoted").map(String::as_str), Some("\"hello\""));
+        assert_eq!(map.get("cid").map(String::as_str), Some("86"));
+        assert_eq!(map.get("flag").map(String::as_str), Some("true"));
+        assert!(!map.contains_key("ignored"));
+        assert_eq!(map.get("nested").map(String::as_str), Some("{\"a\":1}"));
+        assert_eq!(map.get("arr").map(String::as_str), Some("[1,2]"));
+    }
 }

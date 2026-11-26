@@ -1,480 +1,580 @@
 use eframe::egui;
-use crate::{app::{AccountSwitch, Myapp}};
-use common::{account::{signout_account, Account}, cookie_manager::{self, CookieManager}};
-use common::utils::load_texture_from_url;
-use std::sync::Arc;
 
-pub fn render(app: &mut Myapp, ui: &mut egui::Ui){
-    ui.heading("我的账户");
-    ui.separator();
-    let example_account = Account{
-        uid: 0,
-        name: "请登录账号".to_string(),
-        vip_label: "未登录，请登录账号".to_string(),
-        level: "未登录".to_string(),
-        cookie: "".to_string(),
-        csrf: "".to_string(),
-        is_login: false,
-        account_status: "未登录".to_string(),
-        is_active: false,
-        avatar_url: None,
-        
-        avatar_texture:None,
-        
-        cookie_manager: None,
-    };
+use crate::app::{decode_image_to_color_image, AccountSwitch, ImageLoadState, Myapp};
+use common::account::Account;
+use common::utils::MAX_ACCOUNTS;
 
+struct AccountPalette {
+    card_fill: egui::Color32,
+    card_border: egui::Color32,
+    text_primary: egui::Color32,
+    text_secondary: egui::Color32,
+    avatar_bg: egui::Color32,
+    avatar_border: egui::Color32,
+    normal_member_bg: egui::Color32,
+    normal_member_text: egui::Color32,
+    accent: egui::Color32,
+    danger: egui::Color32,
+    success: egui::Color32,
+    inactive_btn: egui::Color32,
+    vip_pink: egui::Color32,
+    init_badge: egui::Color32,
+}
 
-    // 加载默认头像
-    load_default_avatar(ui.ctx(),app);
-
-    if app.account_manager.accounts.is_empty() {
-        if let Some(texture) = app.default_avatar_texture.clone() {
-            show_user(
-                ui,
-                &texture,
-                &example_account,
-                &mut app.delete_account,
-                &mut app.show_login_windows ,
-                &mut app.config,
-                &mut app.account_switch,
-                &mut app.show_add_buyer_window,
-                &mut app.show_orderlist_window,
-                );
-        }
-    } else {
-        let account_count = app.account_manager.accounts.len();
-        for index in 0..account_count {
-            let cookie_manager = app.account_manager.accounts[index].cookie_manager.clone();
-            let avatar_texture = load_user_avatar(ui.ctx(), cookie_manager, &mut app.account_manager.accounts[index]);
-            let texture = avatar_texture.or_else(|| app.default_avatar_texture.clone());
-            if let Some(texture) = texture {
-                show_user(
-                    ui,
-                    &texture,
-                    &app.account_manager.accounts[index],
-                    &mut app.delete_account,
-                    &mut app.show_login_windows ,
-                    &mut app.config,
-                    &mut app.account_switch,
-                    &mut app.show_add_buyer_window,
-                    &mut app.show_orderlist_window,
-                    );
+impl AccountPalette {
+    fn from_dark_mode(dark_mode: bool) -> Self {
+        if dark_mode {
+            Self {
+                card_fill: egui::Color32::from_rgb(36, 38, 46),
+                card_border: egui::Color32::from_rgb(62, 66, 80),
+                text_primary: egui::Color32::from_rgb(235, 238, 245),
+                text_secondary: egui::Color32::from_rgb(165, 172, 188),
+                avatar_bg: egui::Color32::from_rgb(52, 56, 68),
+                avatar_border: egui::Color32::from_rgb(96, 104, 124),
+                normal_member_bg: egui::Color32::from_rgb(54, 58, 72),
+                normal_member_text: egui::Color32::from_rgb(210, 215, 228),
+                accent: egui::Color32::from_rgb(45, 136, 245),
+                danger: egui::Color32::from_rgb(220, 76, 76),
+                success: egui::Color32::from_rgb(46, 160, 67),
+                inactive_btn: egui::Color32::from_rgb(122, 112, 128),
+                vip_pink: egui::Color32::from_rgb(251, 114, 153),
+                init_badge: egui::Color32::from_rgb(218, 145, 38),
             }
-            ui.separator();
-        }
-        if account_count < 2 {
-            if let Some(texture) = app.default_avatar_texture.clone() {
-                show_user(
-                    ui,
-                    &texture,
-                    &example_account,
-                    &mut app.delete_account,
-                    &mut app.show_login_windows ,
-                    &mut app.config,
-                    &mut app.account_switch,
-                    &mut app.show_add_buyer_window,
-                    &mut app.show_orderlist_window,
-                    );
-                ui.separator();
+        } else {
+            Self {
+                card_fill: egui::Color32::from_rgb(248, 249, 252),
+                card_border: egui::Color32::from_rgb(214, 218, 230),
+                text_primary: egui::Color32::from_rgb(35, 40, 52),
+                text_secondary: egui::Color32::from_rgb(100, 108, 124),
+                avatar_bg: egui::Color32::from_rgb(230, 234, 244),
+                avatar_border: egui::Color32::from_rgb(180, 188, 206),
+                normal_member_bg: egui::Color32::from_rgb(232, 236, 246),
+                normal_member_text: egui::Color32::from_rgb(65, 72, 90),
+                accent: egui::Color32::from_rgb(45, 136, 245),
+                danger: egui::Color32::from_rgb(224, 78, 78),
+                success: egui::Color32::from_rgb(46, 160, 67),
+                inactive_btn: egui::Color32::from_rgb(142, 134, 148),
+                vip_pink: egui::Color32::from_rgb(251, 114, 153),
+                init_badge: egui::Color32::from_rgb(224, 146, 32),
             }
-        }
-        let account_count = 0;
-        for index in 0..account_count {
-            let cookie_manager = app.account_manager.accounts[index].cookie_manager.clone();
-            let avatar_texture = load_user_avatar(ui.ctx(), cookie_manager, &mut app.account_manager.accounts[index]);
-            let texture = avatar_texture.or_else(|| app.default_avatar_texture.clone());
-            if let Some(texture) = texture {
-                show_user(
-                    ui,
-                    &texture,
-                    &app.account_manager.accounts[index],
-                    &mut app.delete_account,
-                    &mut app.show_login_windows ,
-                    &mut app.config,
-                    &mut app.account_switch,
-                    &mut app.show_add_buyer_window,
-                    &mut app.show_orderlist_window,
-                    );
-            }
-            ui.separator();
         }
     }
-ui.separator();
-
-
-
 }
-/// 将任意图片显示为圆形
-/// - texture: 要显示的图像纹理
-/// - size: 圆形图片的直径大小
-fn draw_user_avatar(ui: &mut egui::Ui, texture: &egui::TextureHandle, size: f32) -> egui::Response {
-    // 分配正方形区域
-    let (rect, response) = ui.allocate_exact_size(
-        egui::Vec2::new(size, size),
-        egui::Sense::click()
-    );
+
+pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
+    let dark_mode = ui.ctx().style().visuals.dark_mode;
+    let palette = AccountPalette::from_dark_mode(dark_mode);
+
+    // 仅首次解码嵌入默认头像（带圆形抗锯齿遮罩）
+    load_default_avatar(ui.ctx(), app);
+
+    let total_accounts = app.account_manager.accounts.len();
+    let active_accounts = app
+        .account_manager
+        .accounts
+        .iter()
+        .filter(|a| a.is_active)
+        .count();
+
+    // 顶部标题栏：标题 + 账号数量统计 + 防黄牛 2 账号上限控制的「+ 添加账号」按钮
+    let can_add_account = total_accounts < MAX_ACCOUNTS;
+    ui.horizontal(|ui| {
+        ui.heading(
+            egui::RichText::new("我的账户")
+                .size(22.0)
+                .strong()
+                .color(palette.text_primary),
+        );
+        ui.add_space(10.0);
+        egui::Frame::none()
+            .fill(palette.normal_member_bg)
+            .rounding(8.0)
+            .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "共 {} / {} 个账号 · 已开启 {}",
+                        total_accounts, MAX_ACCOUNTS, active_accounts
+                    ))
+                    .size(12.5)
+                    .color(palette.normal_member_text),
+                );
+            });
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let add_btn = egui::Button::new(
+                egui::RichText::new("+ 添加账号")
+                    .size(14.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(palette.accent)
+            .rounding(8.0)
+            .min_size(egui::vec2(108.0, 32.0));
+            let resp = ui
+                .add_enabled(can_add_account, add_btn)
+                .on_hover_text(format!(
+                    "添加新的 B 站账号（防黄牛限制：最多同时保存 {} 个账号）",
+                    MAX_ACCOUNTS
+                ))
+                .on_disabled_hover_text(format!(
+                    "为防止项目被黄牛滥用，最多仅支持同时保存 {} 个账号；如需更换请先登出已有账号",
+                    MAX_ACCOUNTS
+                ));
+            if resp.clicked() {
+                app.show_login_windows = true;
+            }
+        });
+    });
+
+    if !can_add_account {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "🛡 防黄牛限制：当前已达最大账号上限（{} 个）。如需更换其他账号，请先登出已有账号。",
+                MAX_ACCOUNTS
+            ))
+            .size(12.5)
+            .color(palette.text_secondary),
+        );
+    }
+
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    let mut pending_avatar_requests: Vec<(String, String)> = Vec::new();
+    let mut signout_uid: Option<i64> = None;
+    let mut switch_action: Option<AccountSwitch> = None;
+    let mut open_orders_uid: Option<i64> = None;
+    let mut open_add_buyer_uid: Option<i64> = None;
+    let mut open_login_window = false;
+
+    egui::ScrollArea::vertical()
+        .id_source("account_list_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if app.account_manager.accounts.is_empty() {
+                render_empty_state(
+                    ui,
+                    app.default_avatar_texture.as_ref(),
+                    &palette,
+                    &mut open_login_window,
+                );
+            } else {
+                for account in &app.account_manager.accounts {
+                    let avatar_key = format!("avatar:{}", account.uid);
+                    let (avatar_tex, avatar_loading) = match app.image_cache.get(&avatar_key) {
+                        Some(ImageLoadState::Loaded(tex)) => (Some(tex), false),
+                        Some(ImageLoadState::Loading) => {
+                            (app.default_avatar_texture.as_ref(), true)
+                        }
+                        Some(ImageLoadState::Failed) => {
+                            (app.default_avatar_texture.as_ref(), false)
+                        }
+                        None => {
+                            if let Some(url) = account
+                                .avatar_url
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|u| !u.is_empty())
+                            {
+                                pending_avatar_requests
+                                    .push((avatar_key.clone(), url.to_string()));
+                            }
+                            (app.default_avatar_texture.as_ref(), false)
+                        }
+                    };
+
+                    let is_signing_out = app.signout_pending_uids.contains(&account.uid);
+                    let is_initializing = app.initializing_account_uids.contains(&account.uid);
+
+                    render_account_card(
+                        ui,
+                        account,
+                        avatar_tex,
+                        avatar_loading,
+                        is_signing_out,
+                        is_initializing,
+                        &palette,
+                        &mut signout_uid,
+                        &mut switch_action,
+                        &mut open_orders_uid,
+                        &mut open_add_buyer_uid,
+                    );
+                    ui.add_space(10.0);
+                }
+            }
+        });
+
+    // 在不可变借用结束后统一执行状态变更和异步请求
+    for (key, url) in pending_avatar_requests {
+        app.request_image(&key, &url);
+    }
+    if open_login_window {
+        app.show_login_windows = true;
+    }
+    if let Some(uid) = signout_uid {
+        app.request_signout(uid);
+    }
+    if let Some(sw) = switch_action {
+        app.account_switch = Some(sw);
+    }
+    if let Some(uid) = open_orders_uid {
+        app.orderlist_page = 0;
+        app.orderlist_error = None;
+        app.orderlist_detail_id = None;
+        app.orderlist_requesting = false;
+        app.orderlist_active_task_id = None;
+        app.orderlist_need_reload = true;
+        app.show_orderlist_window = Some(uid.to_string());
+    }
+    if let Some(uid) = open_add_buyer_uid {
+        app.add_buyer_input = crate::windows::add_buyer::AddBuyerInput::default();
+        app.add_buyer_active_task_id = None;
+        app.add_buyer_error = None;
+        app.add_buyer_submitting = false;
+        app.show_add_buyer_window = Some(uid.to_string());
+    }
+}
+
+fn render_empty_state(
+    ui: &mut egui::Ui,
+    default_avatar: Option<&egui::TextureHandle>,
+    palette: &AccountPalette,
+    open_login_window: &mut bool,
+) {
+    egui::Frame::none()
+        .fill(palette.card_fill)
+        .rounding(12.0)
+        .stroke(egui::Stroke::new(1.0, palette.card_border))
+        .inner_margin(egui::Margin::symmetric(24.0, 36.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width().max(260.0));
+            ui.vertical_centered(|ui| {
+                draw_user_avatar(ui, default_avatar, 76.0, false, palette);
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new("暂未登录任何账号")
+                        .size(18.0)
+                        .strong()
+                        .color(palette.text_primary),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "为防止被黄牛滥用，最多支持同时登录 {} 个 B 站账号；登录后可管理购票人、查看订单与发起抢票",
+                        MAX_ACCOUNTS
+                    ))
+                        .size(13.5)
+                        .color(palette.text_secondary),
+                );
+                ui.add_space(18.0);
+                let login_btn = egui::Button::new(
+                    egui::RichText::new("立即登录账号")
+                        .size(16.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(palette.accent)
+                .rounding(10.0)
+                .min_size(egui::vec2(170.0, 44.0));
+                if ui.add(login_btn).clicked() {
+                    *open_login_window = true;
+                }
+            });
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_account_card(
+    ui: &mut egui::Ui,
+    account: &Account,
+    avatar_texture: Option<&egui::TextureHandle>,
+    avatar_loading: bool,
+    is_signing_out: bool,
+    is_initializing: bool,
+    palette: &AccountPalette,
+    signout_uid: &mut Option<i64>,
+    switch_action: &mut Option<AccountSwitch>,
+    open_orders_uid: &mut Option<i64>,
+    open_add_buyer_uid: &mut Option<i64>,
+) {
+    egui::Frame::none()
+        .fill(palette.card_fill)
+        .rounding(12.0)
+        .stroke(egui::Stroke::new(1.0, palette.card_border))
+        .inner_margin(egui::Margin::symmetric(16.0, 14.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width().max(260.0));
+
+            // 上半部分：圆形头像 + 账号基础信息
+            ui.horizontal(|ui| {
+                draw_user_avatar(ui, avatar_texture, 72.0, avatar_loading, palette);
+                ui.add_space(14.0);
+
+                ui.vertical(|ui| {
+                    // 昵称与 UID
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(10.0, 4.0);
+                        ui.label(
+                            egui::RichText::new(&account.name)
+                                .size(22.0)
+                                .strong()
+                                .color(palette.text_primary),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("UID: {}", account.uid))
+                                .size(13.5)
+                                .color(palette.text_secondary),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+
+                    // 会员标签、等级标签、客户端初始化状态
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+                        render_vip_badge(ui, &account.vip_label, palette);
+
+                        let level = account.level.trim();
+                        if !level.is_empty() && level != "未登录" {
+                            pill_badge(
+                                ui,
+                                &format!("LV{}", level),
+                                egui::Color32::from_rgb(0, 161, 214),
+                                egui::Color32::WHITE,
+                            );
+                        }
+
+                        if is_initializing {
+                            egui::Frame::none()
+                                .fill(palette.init_badge)
+                                .rounding(8.0)
+                                .inner_margin(egui::Margin::symmetric(7.0, 2.5))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui.add(egui::Spinner::new().size(11.0));
+                                        ui.label(
+                                            egui::RichText::new("初始化中...")
+                                                .size(12.0)
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                        );
+                                    });
+                                });
+                        }
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // 下半部分：响应式操作按钮行（绝不溢出）
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+
+                // 登出按钮（异步执行，登出中禁用）
+                let signout_label = if is_signing_out { "登出中..." } else { "登出" };
+                let signout_btn = egui::Button::new(
+                    egui::RichText::new(signout_label)
+                        .size(14.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .min_size(egui::vec2(96.0, 36.0))
+                .fill(palette.danger)
+                .rounding(8.0);
+                if ui
+                    .add_enabled(!is_signing_out, signout_btn)
+                    .on_hover_text("退出登录并移除本地保存的账号信息")
+                    .clicked()
+                {
+                    *signout_uid = Some(account.uid);
+                }
+
+                // 查看全部订单
+                let orders_btn = egui::Button::new(
+                    egui::RichText::new("查看全部订单")
+                        .size(14.0)
+                        .color(egui::Color32::WHITE),
+                )
+                .min_size(egui::vec2(116.0, 36.0))
+                .fill(palette.accent)
+                .rounding(8.0);
+                if ui.add_enabled(!is_signing_out, orders_btn).clicked() {
+                    *open_orders_uid = Some(account.uid);
+                }
+
+                // 添加购票人
+                let buyer_btn = egui::Button::new(
+                    egui::RichText::new("添加购票人")
+                        .size(14.0)
+                        .color(egui::Color32::WHITE),
+                )
+                .min_size(egui::vec2(106.0, 36.0))
+                .fill(palette.accent)
+                .rounding(8.0);
+                if ui.add_enabled(!is_signing_out, buyer_btn).clicked() {
+                    *open_add_buyer_uid = Some(account.uid);
+                }
+
+                // 抢票开启/关闭开关
+                let (toggle_text, toggle_fill, toggle_hint) = if account.is_active {
+                    (
+                        "抢票开启中",
+                        palette.success,
+                        "当前允许使用此账号抢票，点击切换为关闭",
+                    )
+                } else {
+                    (
+                        "抢票关闭中",
+                        palette.inactive_btn,
+                        "当前已禁止此账号抢票，点击切换为开启",
+                    )
+                };
+                let toggle_btn = egui::Button::new(
+                    egui::RichText::new(toggle_text)
+                        .size(14.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .min_size(egui::vec2(108.0, 36.0))
+                .fill(toggle_fill)
+                .rounding(8.0);
+                if ui
+                    .add_enabled(!is_signing_out, toggle_btn)
+                    .on_hover_text(toggle_hint)
+                    .clicked()
+                {
+                    *switch_action = Some(AccountSwitch {
+                        uid: account.uid.to_string(),
+                        switch: !account.is_active,
+                    });
+                }
+            });
+        });
+}
+
+fn render_vip_badge(ui: &mut egui::Ui, vip_label: &str, palette: &AccountPalette) {
+    let trimmed = vip_label.trim();
+    if !trimmed.is_empty() && !trimmed.starts_with("未登录") {
+        let fill = if trimmed.contains("十年") || trimmed.contains("百年") {
+            egui::Color32::from_rgb(230, 145, 38)
+        } else {
+            palette.vip_pink
+        };
+        pill_badge(ui, trimmed, fill, egui::Color32::WHITE);
+    } else {
+        pill_badge(
+            ui,
+            "正式会员",
+            palette.normal_member_bg,
+            palette.normal_member_text,
+        );
+    }
+}
+
+fn pill_badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32, text_color: egui::Color32) {
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(8.0)
+        .inner_margin(egui::Margin::symmetric(8.0, 2.5))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).color(text_color).size(12.5));
+        });
+}
+
+/// 在常规 UI 图层中绘制已圆形 alpha 遮罩的头像，并叠加清晰圆形边框
+fn draw_user_avatar(
+    ui: &mut egui::Ui,
+    texture: Option<&egui::TextureHandle>,
+    size: f32,
+    is_loading: bool,
+    palette: &AccountPalette,
+) {
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
 
     if ui.is_rect_visible(rect) {
-        // 创建一个离屏渲染的自定义形状层
-        let layer_id = egui::layers::LayerId::new(
-            egui::layers::Order::Background,
-            egui::Id::new("circular_image")
-        );
+        let painter = ui.painter();
+        painter.circle_filled(rect.center(), size * 0.5, palette.avatar_bg);
 
-        let painter = ui.ctx().layer_painter(layer_id);
+        if let Some(tex) = texture {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(tex.id(), rect, uv, egui::Color32::WHITE);
+        }
 
-        // 绘制圆形背景 (这一步可选)
-        painter.circle_filled(
-            rect.center(),
-            size / 2.0,
-            egui::Color32::from_rgb(220, 220, 240)
-        );
-
-        // 使用圆形纹理蒙版技术
-        // 1. 创建一个与图像大小相同的圆形遮罩
-        let circle_mask = egui::Shape::circle_filled(
-            rect.center(),
-            size / 2.0 - 1.0,
-            egui::Color32::WHITE
-        );
-
-        // 2. 将图像绘制为自定义着色器，使用圆形遮罩
-        let uv = egui::Rect::from_min_max(
-            egui::pos2(0.0, 0.0),
-            egui::pos2(1.0, 1.0)
-        );
-
-        // 使用裁剪圆绘制
-        painter.add(circle_mask);
-
-        // 以混合模式绘制图像，只在圆形区域内可见
-        painter.image(
-            texture.id(),
-            rect,
-            uv,
-            egui::Color32::WHITE
-        );
-
-        // 添加边框
         painter.circle_stroke(
             rect.center(),
-            size / 2.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(180, 180, 180, 180))
+            size * 0.5,
+            egui::Stroke::new(1.5, palette.avatar_border),
         );
-    }
 
-    response
-}
-
-fn load_user_avatar(ctx: &egui::Context, cookie_manager: Option<Arc<CookieManager>>, account: &mut Account) ->Option<egui::TextureHandle> {
-    // 如果用户已登录且提供了头像路径，尝试加载
-    if let Some(texture) = &account.avatar_texture {
-        return Some(texture.clone());
-    }
-    if account.is_login && cookie_manager.is_some() {
-        if let Some(avatar_url) = &account.avatar_url {
-            // 尝试加载用户头像
-            let texture_name = format!("user_avatar_{}", account.uid);
-            let texture_option = load_texture_from_url(ctx, cookie_manager.unwrap(), avatar_url, &texture_name);
-
-            account.avatar_texture = texture_option.clone();
-            return texture_option;
+        if is_loading {
+            let badge_size = 18.0;
+            let spinner_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - badge_size, rect.bottom() - badge_size),
+                egui::vec2(badge_size, badge_size),
+            );
+            painter.circle_filled(spinner_rect.center(), badge_size * 0.5, palette.card_fill);
+            ui.put(spinner_rect.shrink(2.0), egui::Spinner::new().size(12.0));
         }
     }
-    //未登录或加载失败
-    None
 }
-// 加载默认头像
+
 fn load_default_avatar(ctx: &egui::Context, app: &mut Myapp) {
     if app.default_avatar_texture.is_some() {
         return;
     }
-    // 使用include_bytes!宏将图片直接嵌入到二进制文件中
-    // 路径是相对于项目根目录的
+
     let default_avatar_bytes = include_bytes!("../../../assets/default_avatar.jpg");
-
-    // 从内存中加载图片
-    match image::load_from_memory(default_avatar_bytes) {
-        Ok(image) => {
-            let size = [image.width() as usize, image.height() as usize];
-            let image_buffer = image.to_rgba8();
-            let pixels = image_buffer.as_flat_samples();
-
+    match decode_image_to_color_image(default_avatar_bytes, true) {
+        Ok(color_image) => {
             app.default_avatar_texture = Some(ctx.load_texture(
                 "default_avatar",
-                egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()),
-                Default::default()
+                color_image,
+                egui::TextureOptions::LINEAR,
             ));
-        },
+        }
         Err(_) => {
-            // 图片加载失败，生成占位符头像
             app.default_avatar_texture = generate_placeholder_avatar(ctx);
         }
     }
 }
 
-// 生成一个占位符头像
 fn generate_placeholder_avatar(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let size = 128; // 头像尺寸
-    let mut image_data = vec![0; size * size * 4];
+    let size = 128usize;
+    let mut image_data = vec![0u8; size * size * 4];
+    let center = (size as f32 - 1.0) * 0.5;
+    let radius = size as f32 * 0.5;
 
-    // 生成一个简单的渐变图案
     for y in 0..size {
         for x in 0..size {
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let alpha = if dist > radius {
+                0
+            } else if dist > radius - 1.5 {
+                (((radius - dist) / 1.5).clamp(0.0, 1.0) * 255.0) as u8
+            } else {
+                255
+            };
+
             let i = (y * size + x) * 4;
-            // 浅蓝色调渐变
-            image_data[i] = 180; // R
-            image_data[i + 1] = 180 + (y as u8) / 2; // G
-            image_data[i + 2] = 230; // B
-            image_data[i + 3] = 255; // A
+            image_data[i] = 140;
+            image_data[i + 1] = 175 + ((y * 45) / size) as u8;
+            image_data[i + 2] = 235;
+            image_data[i + 3] = alpha;
         }
     }
 
     Some(ctx.load_texture(
         "default_avatar",
         egui::ColorImage::from_rgba_unmultiplied([size, size], &image_data),
-        Default::default()
+        egui::TextureOptions::LINEAR,
     ))
 }
-
-fn show_user( //显示用户头像等信息
-    ui: &mut egui::Ui,
-    texture: &egui::TextureHandle,
-
-    account: &Account,
-    delete_account: &mut Option<String>,
-    show_login_windows: &mut bool,
-    config: &mut common::utils::Config,
-    account_switch: &mut Option<AccountSwitch>,
-    show_add_buyer_window: &mut Option<String>,
-    show_orderlist_window: &mut Option<String>,
-
-
-) {
-    let mut user = account.clone();
-    // 创建圆角长方形框架
-    egui::Frame::none()
-        .fill(egui::Color32::from_rgb(245, 245, 250))  // 背景色
-        .rounding(12.0)  // 圆角半径
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(200, 200, 220)))  // 边框
-        .inner_margin(egui::Margin { left: 10.0, right: 20.0, top: 15.0, bottom: 15.0 })  // 内边距
-        .show(ui, |ui| {
-            // 水平布局放置图片和文字
-            ui.horizontal(|ui| {
-                // 左侧图片区域，这里使用小尺寸的圆形图片
-                let image_size = 84.0;
-                draw_user_avatar(ui, texture, image_size);
-
-                ui.add_space(12.0);  // 图片和文字之间的间距
-
-                // 右侧文字区域
-                ui.vertical(|ui| {
-                    //第一行
-                    //显示uid和昵称
-                    ui.horizontal(|ui|{
-                        ui.add(egui::widgets::Label::new(
-                            egui::RichText::new(&user.name)
-                                .size(30.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(60, 60, 80))
-                        ));
-                        ui.add_space(15.0);
-                        ui.add(egui::widgets::Label::new(
-                            egui::RichText::new(format!("UID: {}", user.uid))
-                                .color(egui::Color32::from_rgb(100, 100, 120))
-                                .size(16.0)
-                        ));
-                    });
-                    //第二行
-                    ui.add_space(10.0);
-                    //显示大会员
-                    ui.horizontal(|ui|{
-
-                        match user.vip_label.as_str(){
-                            "月度大会员"=> {
-                                egui::Frame::none()
-                                .fill(egui::Color32::from_rgb(251, 114, 153)) // 粉色背景 #FB7299
-                                .rounding(10.0)  // 圆角
-
-                                .inner_margin(egui::vec2(6.0, 3.0))  // 内边距
-                                .show(ui, |ui| {
-                                    // 白色文字 #FFFFFF
-                                        ui.label(
-                                              egui::RichText::new("月度大会员")
-                                              .color(egui::Color32::from_rgb(255, 255, 255))
-                                                // 白色文字
-                                              .size(15.0)
-                                                    );
-                                 });
-                            }
-                            "年度大会员" =>{
-                                egui::Frame::none()
-                                .fill(egui::Color32::from_rgb(251, 114, 153))  // 粉色背景 #FB7299
-                                .rounding(10.0)  // 圆角
-                                .inner_margin(egui::vec2(6.0, 3.0))  // 内边距
-                                .show(ui, |ui| {
-                                    // 白色文字 #FFFFFF
-                                        ui.label(
-                                              egui::RichText::new("年度大会员")
-                                              .color(egui::Color32::from_rgb(255, 255, 255))  // 白色文字
-                                              .size(15.0)
-                                                    );
-                                 });
-                            }
-                            "十年大会员" =>{
-                                egui::Frame::none()
-                                .fill(egui::Color32::from_rgb(251, 114, 153))  // 粉色背景 #FB7299
-                                .rounding(10.0)  // 圆角
-                                .inner_margin(egui::vec2(6.0, 3.0))  // 内边距
-                                .show(ui, |ui| {
-                                    // 白色文字 #FFFFFF
-                                        ui.label(
-                                              egui::RichText::new("十年大会员")
-                                              .color(egui::Color32::from_rgb(255, 255, 255))  // 白色文字
-                                              .size(15.0)
-                                                    );
-                                 });
-                            }
-                            _ => {
-                                egui::Frame::none()
-
-                                .inner_margin(egui::vec2(6.0, 3.0))  // 内边距
-                                .show(ui, |ui| {
-                                    // 白色文字rgb(0, 0, 0)
-                                        ui.label(
-                                              egui::RichText::new("正式会员")
-                                              .color(egui::Color32::from_rgb(0, 0, 0))  // 白色文字
-                                              .size(15.0)
-                                                    );
-                                 });
-                            }
-
-
-
-                        }
-                    })
-
-                });
-
-
-            });
-            ui.separator();
-            ui.vertical(|ui|{
-                ui.add_space(15.0);
-                ui.horizontal(|ui|{
-                    ui.add_space(15.0);
-                    if !user.is_login {
-
-
-                    let button = egui::Button::new(
-                      egui::RichText::new("登录").size(20.0).color(egui::Color32::WHITE)
-                      )
-                        .min_size(egui::vec2(120.0,50.0))
-                        .fill(egui::Color32::from_rgb(102,204,255))
-                        .rounding(15.0);//圆角成度
-                    let response = ui.add(button);
-                    if response.clicked(){
-                        *show_login_windows = true;
-                    }
-                }else{
-                    let button = egui::Button::new(
-                      egui::RichText::new("登出").size(20.0).color(egui::Color32::WHITE)
-                      )
-                        .min_size(egui::vec2(120.0,50.0))
-                        .fill(egui::Color32::from_rgb(255,174,201))
-                        .rounding(15.0);//圆角成度
-                    let response = ui.add(button);
-                    if response.clicked(){
-                        match signout_account(&user){
-                            Ok(_) => {
-                                *delete_account = Some(user.uid.to_string().clone());
-                                log::info!("登出成功");
-
-                            }
-                            Err(e) => {
-                                log::error!("登出失败: {}", e);
-                            }
-                        }
-
-                    }
-                }
-                    dynamic_caculate_space(ui, 122.0, 3.0);
-                    let button = egui::Button::new(
-                        egui::RichText::new("查看全部订单").size(20.0).color(egui::Color32::WHITE)
-                        )
-                          .min_size(egui::vec2(130.0,50.0))
-                          .fill(egui::Color32::from_rgb(102,204,255))
-                          .rounding(15.0);//圆角成度
-                    let response =   ui.add(button);
-                    if response.clicked(){
-                        *show_orderlist_window = Some(user.uid.to_string().clone());
-                    }
-                    dynamic_caculate_space(ui, 120.0, 2.0);
-                    let button = egui::Button::new(
-                        egui::RichText::new("添加购票人").size(18.0).color(egui::Color32::WHITE)
-                        )
-                          .min_size(egui::vec2(120.0,50.0))
-                          .fill(egui::Color32::from_rgb(102,204,255))
-                          .rounding(15.0);
-                    let response = ui.add(button);
-                    if response.clicked(){
-                        *show_add_buyer_window = Some(user.uid.to_string().clone());
-                    }
-                    dynamic_caculate_space(ui, 120.0, 1.0);
-
-                    if user.is_active == false{
-                            let button = egui::Button::new(
-                              egui::RichText::new("抢票关闭中").size(18.0).color(egui::Color32::WHITE)
-                              )
-                                .min_size(egui::vec2(120.0,50.0))
-                                .fill(egui::Color32::from_rgb(255,174,201))
-                                .rounding(15.0);
-                            let response = ui.add(button);
-                            if response.clicked(){
-                                let switch = AccountSwitch{
-                                    uid: user.uid.to_string(),
-                                    switch: true,
-                                };
-                                *account_switch = Some(switch);
-                            }
-                    }else{
-                            let button = egui::Button::new(
-                              egui::RichText::new("抢票开启中").size(18.0).color(egui::Color32::WHITE)
-                              )
-                                .min_size(egui::vec2(120.0,50.0))
-                                .fill(egui::Color32::from_rgb(102,204,255))
-                                .rounding(15.0);
-                            let response = ui.add(button);
-                            if response.clicked(){
-                                let switch = AccountSwitch{
-                                    uid: user.uid.to_string(),
-                                    switch: false,
-                                };
-                                *account_switch = Some(switch);
-                            }
-                        }
-
-                    });
-
-
-
-            })
-        });
-}
-
-
-
-fn dynamic_caculate_space(
-     ui :&mut egui::Ui,
-     obj_space: f32, //如果有三个按钮，假设每个按钮尺寸x轴长度=120.0，那么就传入120.0
-     number: f32 //按钮数量
-    ) {
-    let available_space = ui.available_width();
-    let mut space = available_space/number - obj_space ;
-    if space < 0.0 {
-        space = 0.0;
-    }
-    ui.add_space(space);
-}
-

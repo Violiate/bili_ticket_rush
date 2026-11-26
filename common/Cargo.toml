@@ -8,7 +8,6 @@ tokio = { version = "1", features = ["full"] }
 rand = "0.8"
 
 eframe = { version = "0.23.0", features = ["default"] }
-egui = "0.31.0"
 
 # log
 log = "0.4.27"
@@ -21,6 +20,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 reqwest = { version = "0.11.22", features = ["json", "blocking", "cookies", "native-tls", "rustls-tls-native-roots"] }
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 
 base64 = "0.21"
 aes = "0.7.5"
@@ -56,6 +57,9 @@ time = "=0.3.47"
 # 基于 BoringSSL，编译需要 CMake + NASM + LLVM/Clang + perl 工具链。
 wreq = { version = "5.3.0", features = ["json", "gzip", "brotli", "deflate", "zstd"], optional = true }
 wreq-util = { version = "2.2.6", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["winuser", "windef"] }
 
 [features]
 default = []
