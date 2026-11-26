@@ -39,10 +39,16 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
 
     let waited_secs = item.created_at.elapsed().as_secs();
 
+    let screen_rect = ctx.screen_rect();
+    let max_w = (screen_rect.width() - 40.0).max(420.0);
+    let max_h = (screen_rect.height() - 40.0).max(460.0);
+
     egui::Window::new("扫码支付")
         .open(&mut window_open)
         .resizable(true)
-        .default_size([480.0, 580.0])
+        .constrain(true)
+        .default_size([480.0_f32.min(max_w), 580.0_f32.min(max_h)])
+        .resize(|r| r.max_size([max_w, max_h]))
         .show(ctx, |ui| {
             // 多成功订单队列徽章
             if queue_len > 1 {
@@ -209,7 +215,7 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
                 let mut url_str = item.pay_url.as_str();
                 ui.add(
                     egui::TextEdit::singleline(&mut url_str)
-                        .desired_width((ui.available_width() - 108.0).max(120.0)),
+                        .desired_width((ui.available_width() - 126.0).max(120.0)),
                 );
                 if ui.button("复制支付链接").clicked() {
                     ui.output_mut(|o| o.copied_text = item.pay_url.clone());
