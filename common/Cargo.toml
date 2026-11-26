@@ -51,17 +51,10 @@ single-instance = "0.3.3"
 time = "=0.3.47"
 
 
-#以下内容AI生成，未经测试
-
-# TLS/JA3/HTTP2 指纹伪装（可选，仅 tls-impersonate feature 启用时编译）。
-# 基于 BoringSSL，编译需要 CMake + NASM + LLVM/Clang + perl 工具链。
-wreq = { version = "5.3.0", features = ["json", "gzip", "brotli", "deflate", "zstd"], optional = true }
-wreq-util = { version = "2.2.6", optional = true }
-
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["winuser", "windef"] }
 
 [features]
 default = []
-# 启用对 show.bilibili.com 请求的浏览器 TLS 指纹伪装。
-tls-impersonate = ["dep:wreq", "dep:wreq-util"]
+# 保留占位特性名以兼容历史构建命令（原可选依赖 wreq 5.3.0 已被 crates.io 撤回且相关代码未启用）
+tls-impersonate = []

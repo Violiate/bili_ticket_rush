@@ -6,7 +6,6 @@
 *~
 /target/
 **/*.rs.bk
-Cargo.lock
 *.pdb
 .DS_Store
 Thumbs.db
