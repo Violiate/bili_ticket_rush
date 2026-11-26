@@ -4,6 +4,9 @@ use eframe::egui::{self, Color32, RichText, Stroke};
 use serde_json::Value;
 
 use crate::app::Myapp;
+use crate::windows::{
+    bounded_window_sizes, show_resizable_body, show_resizable_frame, show_resizable_frame_with,
+};
 
 const TICKET_RIGHT_COL_W: f32 = 214.0;
 const TICKET_ROW_SPACING: f32 = 8.0;
@@ -171,14 +174,7 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
         _ => "未知模式",
     };
 
-    // 将弹窗最大尺寸严格约束在主窗口可视区域内，彻底杜绝任何内容将窗口撑出屏幕右侧
-    let screen_rect = ctx.screen_rect();
-    let max_w = (screen_rect.width() - 40.0).max(540.0);
-    let max_h = (screen_rect.height() - 40.0).max(420.0);
-    let min_w = 540.0_f32.min(max_w);
-    let min_h = 400.0_f32.min(max_h);
-    let default_w = 780.0_f32.min(max_w);
-    let default_h = 600.0_f32.min(max_h);
+    let (default_sz, min_sz, max_sz) = bounded_window_sizes(ctx, 780.0, 600.0, 520.0, 380.0);
 
     let dark_mode = ctx.style().visuals.dark_mode;
     let palette = ScreenPalette::from_dark_mode(dark_mode);
@@ -186,153 +182,207 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
     egui::Window::new("选择场次与票种")
         .id(egui::Id::new("screen_info_window_v2"))
         .open(&mut window_open)
-        .default_size([default_w, default_h])
-        .min_width(min_w)
-        .min_height(min_h)
-        .resize(|r| r.max_size([max_w, max_h]))
+        .default_size(default_sz)
+        .min_width(min_sz[0])
+        .min_height(min_sz[1])
+        .resize(|r| r.max_size(max_sz))
         .constrain(true)
         .resizable(true)
         .collapsible(false)
         .show(ctx, |ui| {
-            // 顶部账号 / 项目ID / 模式信息栏 + 刷新按钮
-            ui.horizontal(|ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-                    ui.label(
-                        RichText::new(format!("账号: {} ({})", account_name, uid))
-                            .size(13.0)
-                            .strong()
-                            .color(palette.text_primary),
-                    );
-                    ui.label(RichText::new("·").color(palette.text_muted));
-                    ui.label(
-                        RichText::new(format!("项目ID: {}", draft_project_id))
-                            .size(13.0)
-                            .color(palette.text_secondary),
-                    );
-                    ui.label(RichText::new("·").color(palette.text_muted));
-                    pill_badge(ui, mode_label, palette.blue_bg, palette.blue);
-                });
+            let render_header = |ui: &mut egui::Ui, retry_clicked: &mut bool| {
+                // 顶部账号 / 项目ID / 模式信息栏 + 刷新按钮
+                ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+                        ui.label(
+                            RichText::new(format!("账号: {} ({})", account_name, uid))
+                                .size(13.0)
+                                .strong()
+                                .color(palette.text_primary),
+                        );
+                        ui.label(RichText::new("·").color(palette.text_muted));
+                        ui.label(
+                            RichText::new(format!("项目ID: {}", draft_project_id))
+                                .size(13.0)
+                                .color(palette.text_secondary),
+                        );
+                        ui.label(RichText::new("·").color(palette.text_muted));
+                        pill_badge(ui, mode_label, palette.blue_bg, palette.blue);
+                    });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let refresh_label = if project_info_requesting {
-                        "刷新中..."
-                    } else {
-                        "刷新项目"
-                    };
-                    if ui
-                        .add_enabled(
-                            !project_info_requesting,
-                            egui::Button::new(RichText::new(refresh_label).size(12.5))
-                                .rounding(6.0),
-                        )
-                        .on_hover_text("重新拉取该项目最新的场次与余票状态")
-                        .clicked()
-                    {
-                        retry_clicked = true;
-                    }
-                });
-            });
-
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(6.0);
-
-            // 错误状态：内联错误提示 + 重试 + 关闭
-            if let Some(err_msg) = project_info_error_ref {
-                ui.add_space(28.0);
-                ui.vertical_centered(|ui| {
-                    egui::Frame::none()
-                        .fill(palette.error_bg)
-                        .stroke(Stroke::new(1.0, palette.error_text))
-                        .rounding(8.0)
-                        .inner_margin(16.0)
-                        .show(ui, |ui| {
-                            ui.set_max_width((ui.available_width() - 32.0).max(260.0));
-                            ui.label(
-                                RichText::new("获取项目详情失败")
-                                    .size(16.0)
-                                    .strong()
-                                    .color(palette.error_text),
-                            );
-                            ui.add_space(6.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(err_msg).color(palette.text_primary),
-                                )
-                                .wrap(true),
-                            );
-                        });
-
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        let btn_w = 96.0;
-                        let total_w = btn_w * 2.0 + 12.0;
-                        let pad = ((ui.available_width() - total_w) * 0.5).max(0.0);
-                        ui.add_space(pad);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let refresh_label = if project_info_requesting {
+                            "刷新中..."
+                        } else {
+                            "刷新项目"
+                        };
                         if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("重试").color(Color32::WHITE).strong(),
-                                )
-                                .fill(palette.accent)
-                                .rounding(7.0)
-                                .min_size(egui::vec2(btn_w, 32.0)),
+                            .add_enabled(
+                                !project_info_requesting,
+                                egui::Button::new(RichText::new(refresh_label).size(12.5))
+                                    .rounding(6.0),
                             )
+                            .on_hover_text("重新拉取该项目最新的场次与余票状态")
                             .clicked()
                         {
-                            retry_clicked = true;
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new("关闭")
-                                    .rounding(7.0)
-                                    .min_size(egui::vec2(btn_w, 32.0)),
-                            )
-                            .clicked()
-                        {
-                            close_clicked = true;
+                            *retry_clicked = true;
                         }
                     });
                 });
-                ui.add_space(24.0);
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(6.0);
+            };
+
+            // 错误状态：保持全区域可缩放骨架，展示内联错误 + 重试 + 关闭
+            if let Some(err_msg) = project_info_error_ref {
+                show_resizable_frame_with(
+                    ui,
+                    &mut retry_clicked,
+                    |ui, retry| render_header(ui, retry),
+                    |_, _| {},
+                    |ui, retry| {
+                        ui.add_space(28.0);
+                        ui.vertical_centered(|ui| {
+                            egui::Frame::none()
+                                .fill(palette.error_bg)
+                                .stroke(Stroke::new(1.0, palette.error_text))
+                                .rounding(8.0)
+                                .inner_margin(16.0)
+                                .show(ui, |ui| {
+                                    ui.set_max_width((ui.available_width() - 32.0).max(260.0));
+                                    ui.label(
+                                        RichText::new("获取项目详情失败")
+                                            .size(16.0)
+                                            .strong()
+                                            .color(palette.error_text),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(err_msg).color(palette.text_primary),
+                                        )
+                                        .wrap(true),
+                                    );
+                                });
+
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                let btn_w = 96.0;
+                                let total_w = btn_w * 2.0 + 12.0;
+                                let pad = ((ui.available_width() - total_w) * 0.5).max(0.0);
+                                ui.add_space(pad);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("重试").color(Color32::WHITE).strong(),
+                                        )
+                                        .fill(palette.accent)
+                                        .rounding(7.0)
+                                        .min_size(egui::vec2(btn_w, 32.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    *retry = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new("关闭")
+                                            .rounding(7.0)
+                                            .min_size(egui::vec2(btn_w, 32.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    close_clicked = true;
+                                }
+                            });
+                        });
+                    },
+                );
                 return;
             }
 
-            // 加载状态：窗口内展示内联 spinner
+            // 加载状态：保持全区域可缩放骨架，展示内联 spinner
             let Some(ticket_data) = project_info_ref else {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(56.0);
-                    ui.add(egui::Spinner::new().size(28.0));
-                    ui.add_space(12.0);
-                    ui.label(
-                        RichText::new("正在获取项目详情与场次列表，请稍候...")
-                            .size(14.5)
-                            .color(palette.text_secondary),
-                    );
-                    ui.add_space(18.0);
-                    if ui
-                        .add(
-                            egui::Button::new("取消")
-                                .rounding(7.0)
-                                .min_size(egui::vec2(88.0, 30.0)),
-                        )
-                        .clicked()
-                    {
-                        close_clicked = true;
-                    }
-                    ui.add_space(40.0);
-                });
+                show_resizable_frame(
+                    ui,
+                    |ui| render_header(ui, &mut retry_clicked),
+                    |_| {},
+                    |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(56.0);
+                            ui.add(egui::Spinner::new().size(28.0));
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new("正在获取项目详情与场次列表，请稍候...")
+                                    .size(14.5)
+                                    .color(palette.text_secondary),
+                            );
+                            ui.add_space(18.0);
+                            if ui
+                                .add(
+                                    egui::Button::new("取消")
+                                        .rounding(7.0)
+                                        .min_size(egui::vec2(88.0, 30.0)),
+                                )
+                                .clicked()
+                            {
+                                close_clicked = true;
+                            }
+                        });
+                    },
+                );
                 return;
             };
 
-            // 主滚动内容区（为底部固定操作条预留稳定高度）
-            let scroll_max_height = (ui.available_height() - 44.0).max(200.0);
-            egui::ScrollArea::vertical()
-                .id_source("screen_info_scroll")
-                .auto_shrink([false, false])
-                .max_height(scroll_max_height)
-                .show(ui, |ui| {
+            let footer_tip = match ticket_method {
+                0 => "点击目标票种即可进入购票人确认，开售前将自动倒计时待命",
+                1 => "直接抢票会立即尝试下单，未开售票种可能触发风控",
+                _ => "选择票种后进入确认页即可提交任务",
+            };
+
+            show_resizable_body(
+                ui,
+                "screen_info_scroll",
+                |ui| render_header(ui, &mut retry_clicked),
+                |ui| {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let tip_w = (ui.available_width() - 88.0).max(120.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(tip_w, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_max_width(tip_w);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(footer_tip)
+                                            .size(12.0)
+                                            .color(palette.text_muted),
+                                    )
+                                    .wrap(true),
+                                );
+                            },
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new("关闭")
+                                        .rounding(6.0)
+                                        .min_size(egui::vec2(72.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                close_clicked = true;
+                            }
+                        });
+                    });
+                },
+                |ui| {
                     // 统一扣除安全余量，使全部卡片边缘齐平且严格小于滚动区宽度，彻底杜绝横向漂移
                     let card_outer_w = (ui.available_width() - 6.0).max(320.0);
                     let card_inner_w = (card_outer_w - 30.0).max(280.0);
@@ -370,36 +420,8 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
                     ui.add_space(10.0);
                     render_project_details_collapsing(ui, ticket_data, card_inner_w, &palette);
                     ui.add_space(6.0);
-                });
-
-            // 底部固定提示与关闭栏
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let footer_tip = match ticket_method {
-                    0 => "点击目标票种即可进入购票人确认，开售前将自动倒计时待命",
-                    1 => "直接抢票会立即尝试下单，未开售票种可能触发风控",
-                    _ => "选择票种后进入确认页即可提交任务",
-                };
-                ui.label(
-                    RichText::new(footer_tip)
-                        .size(12.0)
-                        .color(palette.text_muted),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new("关闭")
-                                .rounding(6.0)
-                                .min_size(egui::vec2(72.0, 28.0)),
-                        )
-                        .clicked()
-                    {
-                        close_clicked = true;
-                    }
-                });
-            });
+                },
+            );
         });
 
     if retry_clicked {

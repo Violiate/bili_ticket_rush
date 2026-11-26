@@ -1,6 +1,7 @@
 use eframe::egui::{self, Color32, Image, RichText, Stroke};
 
 use crate::app::{ImageLoadState, Myapp};
+use crate::windows::{bounded_window_sizes, show_resizable_body_with};
 
 const ORDER_PAGE_SIZE: usize = 10;
 
@@ -44,80 +45,122 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
     let mut images_to_request: Vec<(String, String)> = Vec::new();
     let mut copied_order_id: Option<String> = None;
 
+    let (default_sz, min_sz, max_sz) = bounded_window_sizes(ctx, 840.0, 620.0, 520.0, 380.0);
+
     egui::Window::new("订单列表")
         .open(&mut window_open)
-        .default_height(620.0)
-        .default_width(840.0)
+        .default_size(default_sz)
+        .min_width(min_sz[0])
+        .min_height(min_sz[1])
+        .resize(|r| r.max_size(max_sz))
+        .constrain(true)
         .resizable(true)
         .show(ctx, |ui| {
-            // 顶部信息与刷新栏
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("订单列表");
-                ui.separator();
-                ui.label(
-                    RichText::new(format!("账号: {} ({})", account_name, uid)).strong(),
-                );
-                if current_orders.is_some() {
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("共 {} 条订单", total_orders))
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!app.orderlist_requesting, egui::Button::new("刷新"))
-                        .clicked()
-                    {
-                        page_to_request = Some(current_page);
-                    }
-                    if app.orderlist_requesting {
+            show_resizable_body_with(
+                ui,
+                "orderlist_scroll",
+                &mut page_to_request,
+                |ui, page_req| {
+                    // 顶部信息与刷新栏
+                    ui.horizontal_wrapped(|ui| {
+                        ui.heading("订单列表");
+                        ui.separator();
                         ui.label(
-                            RichText::new("正在加载...")
-                                .color(ui.visuals().weak_text_color()),
+                            RichText::new(format!("账号: {} ({})", account_name, uid)).strong(),
                         );
-                        ui.spinner();
-                    }
-                });
-            });
-
-            ui.separator();
-
-            // 错误提示卡片
-            if let Some(ref err_msg) = app.orderlist_error {
-                egui::Frame::none()
-                    .fill(if ui.visuals().dark_mode {
-                        Color32::from_rgb(60, 24, 24)
-                    } else {
-                        Color32::from_rgb(254, 242, 242)
-                    })
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 68, 55)))
-                    .rounding(8.0)
-                    .inner_margin(12.0)
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
+                        if current_orders.is_some() {
+                            ui.separator();
                             ui.label(
-                                RichText::new(format!("获取订单列表失败: {}", err_msg))
-                                    .color(Color32::from_rgb(220, 68, 55)),
+                                RichText::new(format!("共 {} 条订单", total_orders))
+                                    .color(ui.visuals().weak_text_color()),
                             );
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .add_enabled(!app.orderlist_requesting, egui::Button::new("重试"))
+                                .add_enabled(!app.orderlist_requesting, egui::Button::new("刷新"))
                                 .clicked()
                             {
-                                page_to_request = Some(current_page);
+                                *page_req = Some(current_page);
+                            }
+                            if app.orderlist_requesting {
+                                ui.label(
+                                    RichText::new("正在加载...")
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                                ui.spinner();
                             }
                         });
                     });
-                ui.add_space(8.0);
-            }
 
-            // 主订单滚动区域（为底部分页栏预留空间）
-            let scroll_max_height = (ui.available_height() - 48.0).max(160.0);
-            egui::ScrollArea::vertical()
-                .id_source("orderlist_scroll")
-                .max_height(scroll_max_height)
-                .show(ui, |ui| {
+                    ui.separator();
+                },
+                |ui, page_req| {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let can_prev = !app.orderlist_requesting && current_page > 0;
+                        let can_next = !app.orderlist_requesting
+                            && (current_page + 1) * ORDER_PAGE_SIZE < total_orders;
+
+                        if ui.add_enabled(can_prev, egui::Button::new("上一页")).clicked() {
+                            *page_req = Some(current_page - 1);
+                        }
+
+                        ui.label(format!("第 {} / {} 页", current_page + 1, total_pages));
+
+                        if ui.add_enabled(can_next, egui::Button::new("下一页")).clicked() {
+                            *page_req = Some(current_page + 1);
+                        }
+
+                        if total_orders > 0 {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "每页 {} 条 · 共 {} 条",
+                                            ORDER_PAGE_SIZE, total_orders
+                                        ))
+                                        .color(ui.visuals().weak_text_color()),
+                                    );
+                                },
+                            );
+                        }
+                    });
+                },
+                |ui, page_req| {
+                    // 错误提示卡片
+                    if let Some(ref err_msg) = app.orderlist_error {
+                        egui::Frame::none()
+                            .fill(if ui.visuals().dark_mode {
+                                Color32::from_rgb(60, 24, 24)
+                            } else {
+                                Color32::from_rgb(254, 242, 242)
+                            })
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(220, 68, 55)))
+                            .rounding(8.0)
+                            .inner_margin(12.0)
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("获取订单列表失败: {}", err_msg))
+                                            .color(Color32::from_rgb(220, 68, 55)),
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            !app.orderlist_requesting,
+                                            egui::Button::new("重试"),
+                                        )
+                                        .clicked()
+                                    {
+                                        *page_req = Some(current_page);
+                                    }
+                                });
+                            });
+                        ui.add_space(8.0);
+                    }
                     if let Some(ref order_resp) = current_orders {
                         if order_resp.data.list.is_empty() {
                             ui.vertical_centered(|ui| {
@@ -521,35 +564,8 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
                         });
                     }
                     ui.add_space(6.0);
-                });
-
-            ui.separator();
-
-            // 底部分页控制栏
-            ui.horizontal(|ui| {
-                let can_prev = !app.orderlist_requesting && current_page > 0;
-                let can_next = !app.orderlist_requesting
-                    && (current_page + 1) * ORDER_PAGE_SIZE < total_orders;
-
-                if ui.add_enabled(can_prev, egui::Button::new("上一页")).clicked() {
-                    page_to_request = Some(current_page - 1);
-                }
-
-                ui.label(format!("第 {} / {} 页", current_page + 1, total_pages));
-
-                if ui.add_enabled(can_next, egui::Button::new("下一页")).clicked() {
-                    page_to_request = Some(current_page + 1);
-                }
-
-                if total_orders > 0 {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("每页 {} 条 · 共 {} 条", ORDER_PAGE_SIZE, total_orders))
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                    });
-                }
-            });
+                },
+            );
         });
 
     for (key, url) in images_to_request {

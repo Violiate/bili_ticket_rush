@@ -21,3 +21,4 @@ config
 /models/
 /效果/
 permissions
+/.gemini/

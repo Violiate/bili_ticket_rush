@@ -9,6 +9,7 @@ use image::Luma;
 use qrcode::QrCode;
 
 use crate::app::{normalize_fullwidth_ascii, Myapp};
+use crate::windows::{bounded_window_sizes, show_resizable_body_with};
 
 pub struct LoginTexture {
     pub left_conrner_texture: Option<egui::TextureHandle>,
@@ -44,99 +45,20 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
         }
     }
 
+    let (default_sz, min_sz, max_sz) = bounded_window_sizes(ctx, 620.0, 450.0, 480.0, 360.0);
+
     egui::Window::new("登录窗口")
         .open(&mut window_open)
-        .default_size([620.0, 440.0])
+        .default_size(default_sz)
+        .min_width(min_sz[0])
+        .min_height(min_sz[1])
+        .resize(|r| r.max_size(max_sz))
+        .constrain(true)
         .resizable(true)
         .show(ctx, |ui| {
-            ui.set_min_size(egui::vec2(560.0, 380.0));
+            let window_rect = ui.available_rect_before_wrap();
 
-            // 居中对称的登录方式切换栏（无硬编码偏移）
-            let tabs = [
-                ("扫码登录", "扫码登录"),
-                ("短信登录", "短信登录"),
-                ("Cookie登录", "ck登录"),
-                ("密码登录", "密码登录"),
-            ];
-            ui.columns(tabs.len(), |cols| {
-                for (i, (label, method_key)) in tabs.iter().enumerate() {
-                    cols[i].vertical_centered(|ui| {
-                        let is_selected = app.login_method == *method_key;
-                        let mut text = RichText::new(*label).size(16.0);
-                        if is_selected {
-                            text = text.strong().color(Color32::from_rgb(59, 130, 246));
-                        }
-                        if ui.selectable_label(is_selected, text).clicked() {
-                            if app.login_method != *method_key {
-                                if *method_key != "扫码登录" {
-                                    stop_qr_login_tasks(app);
-                                }
-                                app.login_method = (*method_key).to_string();
-                            }
-                        }
-                    });
-                }
-            });
-
-            ui.separator();
-            if app.account_manager.accounts.len() >= MAX_ACCOUNTS {
-                ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(if ui.visuals().dark_mode {
-                        Color32::from_rgb(64, 48, 22)
-                    } else {
-                        Color32::from_rgb(255, 247, 230)
-                    })
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(217, 119, 6)))
-                    .rounding(6.0)
-                    .inner_margin(8.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!(
-                                    "🛡 当前已达防黄牛上限（最多 {} 个账号）：仅允许重新登录已有账号刷新凭证，新增其他账号将被拦截。",
-                                    MAX_ACCOUNTS
-                                ))
-                                .size(12.5)
-                                .color(if ui.visuals().dark_mode {
-                                    Color32::from_rgb(255, 206, 120)
-                                } else {
-                                    Color32::from_rgb(166, 90, 10)
-                                }),
-                            )
-                            .wrap(true),
-                        );
-                    });
-            }
-            ui.add_space(12.0);
-
-            // 直接按当前 login_method 映射到轻量 Copy 枚举，避免借用冲突与 unreachable!()
-            #[derive(Clone, Copy)]
-            enum LoginTab {
-                QrCode,
-                Sms,
-                Cookie,
-                Password,
-            }
-            let active_tab = match app.login_method.as_str() {
-                "扫码登录" => LoginTab::QrCode,
-                "短信登录" => LoginTab::Sms,
-                "ck登录" | "Cookie登录" => LoginTab::Cookie,
-                "密码登录" => LoginTab::Password,
-                _ => {
-                    app.login_method = "扫码登录".to_string();
-                    LoginTab::QrCode
-                }
-            };
-            match active_tab {
-                LoginTab::QrCode => ui_qrcode_login(ui, app),
-                LoginTab::Sms => ui_sms_login(ui, app),
-                LoginTab::Cookie => ui_ck_login(ui, app),
-                LoginTab::Password => ui_password_login(ui, app),
-            }
-
-            // 绘制左下/右下装饰图（保持在窗口底层边缘且不遮挡主操作区）
-            let window_rect = ui.max_rect();
+            // 先在窗口底层绘制左下/右下装饰图，确保缩放窗口时绝不会遮挡正文、输入框和按钮
             let scale_factor = 0.55;
             if let Some(texture) = &app.login_texture.left_conrner_texture {
                 let scaled_size = texture.size_vec2() * scale_factor;
@@ -146,7 +68,7 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
                     texture.id(),
                     image_rect,
                     egui::Rect::from_min_max([0.0, 0.0].into(), [1.0, 1.0].into()),
-                    Color32::from_white_alpha(200),
+                    Color32::from_white_alpha(180),
                 );
             }
             if let Some(texture) = &app.login_texture.right_conrner_texture {
@@ -160,9 +82,102 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context) {
                     texture.id(),
                     image_rect,
                     egui::Rect::from_min_max([0.0, 0.0].into(), [1.0, 1.0].into()),
-                    Color32::from_white_alpha(200),
+                    Color32::from_white_alpha(180),
                 );
             }
+
+            show_resizable_body_with(
+                ui,
+                "login_window_scroll",
+                app,
+                |ui, app| {
+                    // 居中对称的登录方式切换栏（无硬编码偏移）
+                    let tabs = [
+                        ("扫码登录", "扫码登录"),
+                        ("短信登录", "短信登录"),
+                        ("Cookie登录", "ck登录"),
+                        ("密码登录", "密码登录"),
+                    ];
+                    ui.columns(tabs.len(), |cols| {
+                        for (i, (label, method_key)) in tabs.iter().enumerate() {
+                            cols[i].vertical_centered(|ui| {
+                                let is_selected = app.login_method == *method_key;
+                                let mut text = RichText::new(*label).size(16.0);
+                                if is_selected {
+                                    text = text.strong().color(Color32::from_rgb(59, 130, 246));
+                                }
+                                if ui.selectable_label(is_selected, text).clicked() {
+                                    if app.login_method != *method_key {
+                                        if *method_key != "扫码登录" {
+                                            stop_qr_login_tasks(app);
+                                        }
+                                        app.login_method = (*method_key).to_string();
+                                    }
+                                }
+                            });
+                        }
+                    });
+
+                    ui.separator();
+                    if app.account_manager.accounts.len() >= MAX_ACCOUNTS {
+                        ui.add_space(6.0);
+                        egui::Frame::none()
+                            .fill(if ui.visuals().dark_mode {
+                                Color32::from_rgb(64, 48, 22)
+                            } else {
+                                Color32::from_rgb(255, 247, 230)
+                            })
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(217, 119, 6)))
+                            .rounding(6.0)
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "🛡 当前已达防黄牛上限（最多 {} 个账号）：仅允许重新登录已有账号刷新凭证，新增其他账号将被拦截。",
+                                            MAX_ACCOUNTS
+                                        ))
+                                        .size(12.5)
+                                        .color(if ui.visuals().dark_mode {
+                                            Color32::from_rgb(255, 206, 120)
+                                        } else {
+                                            Color32::from_rgb(166, 90, 10)
+                                        }),
+                                    )
+                                    .wrap(true),
+                                );
+                            });
+                    }
+                    ui.add_space(8.0);
+                },
+                |_, _| {},
+                |ui, app| {
+                    // 直接按当前 login_method 映射到轻量 Copy 枚举，避免借用冲突与 unreachable!()
+                    #[derive(Clone, Copy)]
+                    enum LoginTab {
+                        QrCode,
+                        Sms,
+                        Cookie,
+                        Password,
+                    }
+                    let active_tab = match app.login_method.as_str() {
+                        "扫码登录" => LoginTab::QrCode,
+                        "短信登录" => LoginTab::Sms,
+                        "ck登录" | "Cookie登录" => LoginTab::Cookie,
+                        "密码登录" => LoginTab::Password,
+                        _ => {
+                            app.login_method = "扫码登录".to_string();
+                            LoginTab::QrCode
+                        }
+                    };
+                    match active_tab {
+                        LoginTab::QrCode => ui_qrcode_login(ui, app),
+                        LoginTab::Sms => ui_sms_login(ui, app),
+                        LoginTab::Cookie => ui_ck_login(ui, app),
+                        LoginTab::Password => ui_password_login(ui, app),
+                    }
+                },
+            );
         });
 
     if !window_open {
@@ -553,6 +568,7 @@ fn ui_ck_login(ui: &mut egui::Ui, app: &mut Myapp) {
         ui.label(RichText::new("粘贴 B站完整 Cookie").size(15.0).strong());
         ui.add_space(6.0);
 
+        let cookie_box_w = (ui.available_width() - 24.0).clamp(240.0, 460.0);
         egui::ScrollArea::vertical()
             .id_source("cookie_login_input_scroll")
             .max_height(120.0)
@@ -561,7 +577,7 @@ fn ui_ck_login(ui: &mut egui::Ui, app: &mut Myapp) {
                     egui::TextEdit::multiline(&mut app.login_input.cookie)
                         .hint_text("请粘贴完整 Cookie（需包含 SESSDATA、bili_jct 等字段）")
                         .desired_rows(4)
-                        .desired_width(440.0),
+                        .desired_width(cookie_box_w),
                 );
             });
 

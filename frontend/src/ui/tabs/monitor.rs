@@ -135,20 +135,40 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let log_count = app.logs.len();
             let log_btn_text = if app.show_log_window {
-                "隐藏实时日志窗口"
+                "📜 收起实时日志窗口".to_string()
+            } else if log_count > 0 {
+                format!("📜 打开实时日志 ({})", log_count)
             } else {
-                "打开实时日志窗口"
+                "📜 打开实时日志窗口".to_string()
+            };
+            let (fill, stroke) = if app.show_log_window {
+                (
+                    egui::Color32::from_rgb(16, 152, 104),
+                    egui::Stroke::new(1.2, egui::Color32::from_rgb(52, 211, 153)),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgb(37, 122, 235),
+                    egui::Stroke::new(1.2, egui::Color32::from_rgb(112, 176, 255)),
+                )
             };
             let log_btn = egui::Button::new(
                 egui::RichText::new(log_btn_text)
                     .color(egui::Color32::WHITE)
-                    .size(13.0),
+                    .strong()
+                    .size(13.5),
             )
-            .fill(palette.slate)
-            .rounding(7.0)
-            .min_size(egui::vec2(120.0, 28.0));
-            if ui.add(log_btn).clicked() {
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(8.0)
+            .min_size(egui::vec2(152.0, 32.0));
+            if ui
+                .add(log_btn)
+                .on_hover_text("实时查看抢票执行详情、接口返回与错误排查日志")
+                .clicked()
+            {
                 app.show_log_window = !app.show_log_window;
             }
         });

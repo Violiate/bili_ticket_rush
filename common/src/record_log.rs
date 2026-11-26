@@ -147,6 +147,39 @@ fn is_workspace_target(target: &str) -> bool {
     )
 }
 
+fn format_log_entry(now: DateTime<Local>, level_tag: &str, message: std::fmt::Arguments<'_>) -> String {
+    let timestamp = now.format("%Y-%m-%d %H:%M:%S.%3f");
+    let label = TASK_LABEL.try_with(|l| l.clone()).ok();
+    match label {
+        Some(l) => format!("[{}] {} [{}]: {}", timestamp, level_tag, l, message),
+        None => format!("[{}] {}: {}", timestamp, level_tag, message),
+    }
+}
+
+fn push_formatted_log(now: DateTime<Local>, level: Level, log_message: String) {
+    // 使用 try_lock 避免长时间等待或潜在重入死锁，并兼容 poisoned 锁
+    match LOG_COLLECTOR.try_lock() {
+        Ok(mut collector) => collector.add(log_message.clone()),
+        Err(TryLockError::Poisoned(e)) => e.into_inner().add(log_message.clone()),
+        Err(TryLockError::WouldBlock) => {}
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let _ = writeln!(std::io::stdout(), "{}", log_message);
+    }
+
+    // 单独处理文件写入，避免同时持有多个锁
+    let _ = write_to_log_file(now, level, &log_message);
+}
+
+/// 记录独立的 `SUCCESS` 分类日志（用于下单成功等关键里程碑事件），实时展示并立即刷盘。
+pub fn log_order_success(message: impl std::fmt::Display) {
+    let now = Local::now();
+    let log_message = format_log_entry(now, "SUCCESS", format_args!("{}", message));
+    push_formatted_log(now, Level::Info, log_message);
+}
+
 struct CollectorLogger;
 
 impl log::Log for CollectorLogger {
@@ -160,27 +193,8 @@ impl log::Log for CollectorLogger {
         }
 
         let now = Local::now();
-        let timestamp = now.format("%Y-%m-%d %H:%M:%S.%3f");
-        let label = TASK_LABEL.try_with(|l| l.clone()).ok();
-        let log_message = match label {
-            Some(l) => format!("[{}] {} [{}]: {}", timestamp, record.level(), l, record.args()),
-            None => format!("[{}] {}: {}", timestamp, record.level(), record.args()),
-        };
-
-        // 使用 try_lock 避免长时间等待或潜在重入死锁，并兼容 poisoned 锁
-        match LOG_COLLECTOR.try_lock() {
-            Ok(mut collector) => collector.add(log_message.clone()),
-            Err(TryLockError::Poisoned(e)) => e.into_inner().add(log_message.clone()),
-            Err(TryLockError::WouldBlock) => {}
-        }
-
-        #[cfg(debug_assertions)]
-        {
-            let _ = writeln!(std::io::stdout(), "{}", log_message);
-        }
-
-        // 单独处理文件写入，避免同时持有多个锁
-        let _ = write_to_log_file(now, record.level(), &log_message);
+        let log_message = format_log_entry(now, record.level().as_str(), *record.args());
+        push_formatted_log(now, record.level(), log_message);
     }
 
     fn flush(&self) {
@@ -318,5 +332,12 @@ mod tests {
 
         drop(writer);
         let _ = fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn format_log_entry_supports_success_category_tag() {
+        let now = Local::now();
+        let line = format_log_entry(now, "SUCCESS", format_args!("下单成功！订单号: 123456"));
+        assert!(line.contains("] SUCCESS: 下单成功！订单号: 123456"));
     }
 }

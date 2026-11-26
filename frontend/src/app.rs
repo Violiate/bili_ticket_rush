@@ -90,6 +90,7 @@ pub struct AccountSwitch {
 pub struct Myapp {
     pub app: String,
     pub version: String,
+    pub display_version: String,
     pub policy: Option<Value>,
     pub permissions: Option<Value>,
     pub policy_requested: bool,
@@ -108,7 +109,7 @@ pub struct Myapp {
     // 日志记录与过滤
     pub logs: Vec<String>,
     pub show_log_window: bool,
-    pub log_filter_level: u8, // 0=全部, 1=INFO+, 2=WARN+, 3=ERROR
+    pub log_filter_level: u8, // 0=全部, 1=INFO+, 2=WARN+, 3=ERROR, 4=SUCCESS(下单成功)
     pub log_search_query: String,
     pub log_auto_scroll: bool,
 
@@ -381,7 +382,8 @@ impl Myapp {
 
         let mut app = Self {
             app: String::from("BRT"),
-            version: String::from("6.6.6"),
+            version: String::from(crate::version::POLICY_CLIENT_VERSION),
+            display_version: crate::version::display_version(),
             policy: None,
             permissions: None,
             policy_requested: false,
@@ -1438,7 +1440,7 @@ impl Myapp {
                         self.pending_pay_qrs.push_back(item);
                         let yuan = pay_money_fen as f64 / 100.0;
                         let title = format!("恭喜！{} 抢票成功（¥{:.2}）", confirm.project_name, yuan);
-                        log::info!("{} 订单号: {}", title, order_id);
+                        log::info!("已弹出支付二维码，订单号: {}（请在有效期内尽快完成支付）", order_id);
                         self.show_success(title);
                         // 注意：推送通知已由 backend/src/taskmanager.rs 使用实时 PushConfig 单次发出，此处不再重复提交 PushRequest
                     } else {

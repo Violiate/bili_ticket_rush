@@ -16,10 +16,184 @@ use tokio::sync::watch;
 pub const ERR_NETWORK: i32 = -1001;
 /// 内部错误码：响应 JSON 解析失败或关键字段缺失
 pub const ERR_PARSE: i32 = -1002;
+/// 内部错误码：下单接口返回 errno=0 但 msg 含 defaultBBR 降级标记（实际未成单）
+pub const ERR_DEGRADED_BBR: i32 = -1003;
 /// 内部错误码：本地传参错误（不可通过重试修复）
 pub const ERR_INVALID_PARAM: i32 = 999;
 /// 内部错误码：id_bind 字段值非法
 pub const ERR_ID_BIND_INVALID: i32 = 919;
+
+const CREATE_ORDER_V2_URL: &str = "https://show.bilibili.com/api/ticket/order/createV2";
+const GET_PAY_PARAM_URL: &str = "https://show.bilibili.com/api/ticket/order/getPayParam";
+/// 获取 PC 扫码支付链接 (`code_url`) 专用桌面端 UA：
+/// 当用户在设置中开启移动端自定义 UA（Android/Mobile）时，B站 createstatus/getPayParam
+/// 会按移动端 H5（deviceType=2）下发收银台签名参数而不返回 code_url；
+/// 仅在已下单成功后查询 getPayParam 时以标准 PC Chrome UA 请求，即可拿到直扫支付链接。
+const PC_PAY_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateOrderFailure {
+    pub code: i32,
+    pub message: String,
+    pub updated_pay_money: Option<i64>,
+}
+
+impl CreateOrderFailure {
+    pub fn from_code(code: i32) -> Self {
+        Self {
+            code,
+            message: String::new(),
+            updated_pay_money: None,
+        }
+    }
+
+    pub fn from_code_msg(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            updated_pay_money: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayParamError {
+    /// 服务端明确返回订单不存在 / 已关闭 / 已取消（属于假票或已被回滚）
+    OrderNotFound { code: i64, message: String },
+    /// 订单可能有效但无直扫二维码（如仅支持App支付、0元票、未返回code_url或临时网络异常）
+    Unavailable(String),
+}
+
+impl std::fmt::Display for PayParamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PayParamError::OrderNotFound { code, message } => {
+                write!(f, "订单不存在或已失效({}): {}", code, message)
+            }
+            PayParamError::Unavailable(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+/// 过滤掉 Cookie 中仅用于移动端/App 场景的来源标识，保留全部登录与风控凭据，
+/// 避免 `getPayParam` 将请求识别为移动端 H5（deviceType=2）从而省略 `code_url`。
+pub(crate) fn build_pc_pay_cookie_header(all_cookies: &str) -> String {
+    all_cookies
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let key = pair
+                .split_once('=')
+                .map(|(k, _)| k.trim())
+                .unwrap_or("");
+            !key.eq_ignore_ascii_case("msource")
+                && !key.eq_ignore_ascii_case("kfcsource")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// 构造 B站会员购订单详情页兜底链接（仅在接口确实未下发第三方直扫 code_url 时兜底）
+pub fn build_order_detail_fallback_url(order_id: &str) -> String {
+    format!(
+        "https://show.bilibili.com/platform/orderDetail.html?order_id={}",
+        order_id.trim()
+    )
+}
+
+/// 解析 `/api/ticket/order/getPayParam` 响应，提取 `code_url`（同时兼容顶层/嵌套及常见别名字段）
+pub(crate) fn parse_pay_param_response(value: &Value) -> Result<CheckFakeResultData, PayParamError> {
+    if let Some((err_code, err_msg)) = extract_api_error(value) {
+        let is_not_found = matches!(err_code, 100018 | 100009)
+            || err_msg.contains("订单不存在")
+            || err_msg.contains("订单已取消")
+            || err_msg.contains("订单已关闭")
+            || err_msg.contains("订单已失效");
+        if is_not_found {
+            return Err(PayParamError::OrderNotFound {
+                code: err_code,
+                message: err_msg,
+            });
+        }
+        return Err(PayParamError::Unavailable(format!(
+            "getPayParam 失败({}): {}",
+            err_code, err_msg
+        )));
+    }
+
+    let Some(data) = value.get("data").filter(|d| d.is_object()) else {
+        return Err(PayParamError::Unavailable(
+            "getPayParam 响应缺少有效 data 对象".to_string(),
+        ));
+    };
+
+    fn extract_url(obj: &Value) -> Option<&str> {
+        for key in ["code_url", "codeUrl", "pay_url", "payUrl", "qrcode_url"] {
+            if let Some(s) = obj
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    let code_url = extract_url(data)
+        .or_else(|| data.get("payParam").and_then(extract_url))
+        .unwrap_or("");
+
+    if code_url.is_empty() {
+        let device_type_hint = data
+            .get("deviceType")
+            .or_else(|| data.get("payParam").and_then(|p| p.get("deviceType")))
+            .and_then(|v| v.as_i64())
+            .map(|dt| format!(" (deviceType={})", dt))
+            .unwrap_or_default();
+        return Err(PayParamError::Unavailable(format!(
+            "getPayParam 未返回有效 code_url{}",
+            device_type_hint
+        )));
+    }
+
+    let sign = data
+        .get("sign")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            data.get("payParam")
+                .and_then(|p| p.get("sign"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("")
+        .to_string();
+
+    Ok(CheckFakeResultData {
+        sign,
+        code_url: code_url.to_string(),
+    })
+}
+
+/// 检测 B站 createV2 在 errno=0 时返回的 `defaultBBR` 降级假成功响应
+pub(crate) fn is_create_order_degraded_response(value: &Value) -> bool {
+    let msg = value
+        .get("msg")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("message").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    msg.contains("defaultBBR")
+}
+
+/// 在 error=100034（票价错误）时提取接口返回的最新应付金额（单位：分）
+pub(crate) fn extract_updated_pay_money(value: &Value) -> Option<i64> {
+    value
+        .get("data")
+        .and_then(|d| d.get("pay_money"))
+        .and_then(|v| v.as_i64())
+        .filter(|&m| m > 0)
+}
 
 const DEFAULT_QRCODE_POLL_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -781,23 +955,53 @@ pub(crate) fn build_token_risk_param(
     }
 }
 
-pub(crate) fn parse_confirm_ticket_response(json: &Value) -> Result<ConfirmTicketResult, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmOrderFailure {
+    pub code: Option<i64>,
+    pub message: String,
+}
+
+impl std::fmt::Display for ConfirmOrderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(f, "确认订单失败({}): {}", code, self.message),
+            None => write!(f, "{}", self.message),
+        }
+    }
+}
+
+pub(crate) fn parse_confirm_ticket_response(
+    json: &Value,
+) -> Result<ConfirmTicketResult, ConfirmOrderFailure> {
     if let Some((err_code, msg)) = extract_api_error(json) {
-        return Err(format!("确认订单失败({}): {}", err_code, msg));
+        return Err(ConfirmOrderFailure {
+            code: Some(err_code),
+            message: msg,
+        });
     }
 
     let Some(data) = json.get("data").filter(|d| d.is_object()) else {
-        return Err("确认订单响应缺少有效 data 对象".to_string());
+        return Err(ConfirmOrderFailure {
+            code: None,
+            message: "确认订单响应缺少有效 data 对象".to_string(),
+        });
     };
 
-    let confirm_result: ConfirmTicketResult = serde_json::from_value(data.clone())
-        .map_err(|e| format!("解析确认订单结果失败: {}", e))?;
+    let confirm_result: ConfirmTicketResult = serde_json::from_value(data.clone()).map_err(|e| {
+        ConfirmOrderFailure {
+            code: None,
+            message: format!("解析确认订单结果失败: {}", e),
+        }
+    })?;
 
     if confirm_result.count <= 0 {
-        return Err(format!(
-            "确认订单数据不完整：购票数量无效 (count={})",
-            confirm_result.count
-        ));
+        return Err(ConfirmOrderFailure {
+            code: None,
+            message: format!(
+                "确认订单数据不完整：购票数量无效 (count={})",
+                confirm_result.count
+            ),
+        });
     }
 
     Ok(confirm_result)
@@ -818,6 +1022,30 @@ fn simple_risk_err(code: i32, message: impl Into<String>) -> TokenRiskParam {
     }
 }
 
+pub(crate) fn build_prepare_order_payload(
+    project_id_int: i64,
+    screen_id_int: i64,
+    sku_id_int: i64,
+    count: i16,
+    buyer_info: &[BuyerInfo],
+    ctoken: &str,
+) -> Value {
+    json!({
+        "count": count,
+        "screen_id": screen_id_int,
+        "order_type": 1,
+        "project_id": project_id_int,
+        "sku_id": sku_id_int,
+        "buyer_info": buyer_info,
+        "ignoreRequestLimit": true,
+        "ticket_agent": "",
+        "token": ctoken,
+        "newRisk": true,
+        "requestSource": "neul-next",
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn get_ticket_token(
     cookie_manager: Arc<CookieManager>,
     cpdd: Arc<Mutex<CTokenGenerator>>,
@@ -826,6 +1054,7 @@ pub async fn get_ticket_token(
     ticket_id: &str,
     count: i16,
     is_hot: bool,
+    buyer_info: &[BuyerInfo],
 ) -> Result<(String, String), TokenRiskParam> {
     let project_id_int = project_id
         .parse::<i64>()
@@ -845,16 +1074,14 @@ pub async fn get_ticket_token(
         String::new()
     };
 
-    let params = json!({
-        "count": count,
-        "screen_id": screen_id_int,
-        "order_type": 1,
-        "project_id": project_id_int,
-        "sku_id": sku_id_int,
-        "token": ctoken,
-        "newRisk": true,
-        "requestSource": "neul-next",
-    });
+    let params = build_prepare_order_payload(
+        project_id_int,
+        screen_id_int,
+        sku_id_int,
+        count,
+        buyer_info,
+        &ctoken,
+    );
 
     log::debug!("获取票token参数：{:?}", params);
     let base_url = "https://show.bilibili.com/api/ticket/order/prepare";
@@ -914,19 +1141,16 @@ pub async fn get_ticket_token(
         return Err(simple_risk_err(ERR_PARSE, "接口返回空 token"));
     }
 
-    if is_hot {
-        let ptoken = json["data"]["ptoken"].as_str().unwrap_or("");
-        Ok((token.to_string(), ptoken.to_string()))
-    } else {
-        Ok((token.to_string(), String::new()))
-    }
+    // 无论项目详情初始是否标记 hotProject，只要 prepare 下发了 ptoken 就保留透传
+    let ptoken = json["data"]["ptoken"].as_str().unwrap_or("").trim();
+    Ok((token.to_string(), ptoken.to_string()))
 }
 
 pub async fn confirm_ticket_order(
     cookie_manager: Arc<CookieManager>,
     project_id: &str,
     token: &str,
-) -> Result<ConfirmTicketResult, String> {
+) -> Result<ConfirmTicketResult, ConfirmOrderFailure> {
     let response = cookie_manager
         .get("https://show.bilibili.com/api/ticket/order/confirmInfo")
         .await
@@ -938,20 +1162,28 @@ pub async fn confirm_ticket_order(
         ])
         .send()
         .await
-        .map_err(|e| format!("请求失败: {}", e))?;
+        .map_err(|e| ConfirmOrderFailure {
+            code: None,
+            message: format!("请求失败: {}", e),
+        })?;
 
     if !response.status().is_success() {
-        return Err(format!("请求失败: {}", response.status()));
+        return Err(ConfirmOrderFailure {
+            code: Some(response.status().as_u16() as i64),
+            message: format!("请求失败: {}", response.status()),
+        });
     }
 
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("获取响应文本失败: {}", e))?;
+    let text = response.text().await.map_err(|e| ConfirmOrderFailure {
+        code: None,
+        message: format!("获取响应文本失败: {}", e),
+    })?;
     log::debug!("确认订单响应：{}", text);
 
-    let json: Value =
-        serde_json::from_str(&text).map_err(|e| format!("解析响应文本失败: {}", e))?;
+    let json: Value = serde_json::from_str(&text).map_err(|e| ConfirmOrderFailure {
+        code: None,
+        message: format!("解析响应文本失败: {}", e),
+    })?;
 
     parse_confirm_ticket_response(&json)
 }
@@ -981,6 +1213,8 @@ pub(crate) fn build_create_order_payload(
     let ticket_id_int = ticket_id_str.parse::<i64>().map_err(|_| ERR_INVALID_PARAM)?;
     let request_source = if is_mobile { "neul-next" } else { "pc-new" };
 
+    let include_hot_tokens = is_hot || !ptoken_clean.is_empty();
+
     match id_bind {
         0 => {
             let no_bind = match no_bind_buyer_info {
@@ -998,6 +1232,7 @@ pub(crate) fn build_create_order_payload(
                 "buyer": no_bind.name,
                 "tel": no_bind.tel,
                 "clickPosition": click_position,
+                "again": 1,
                 "newRisk": true,
                 "requestSource": request_source,
                 "deviceId": device_id,
@@ -1005,10 +1240,15 @@ pub(crate) fn build_create_order_payload(
                 "count": count,
                 "timestamp": timestamp,
                 "order_type": 1,
+                "orderCreateUrl": CREATE_ORDER_V2_URL,
             });
-            if is_hot {
+            if include_hot_tokens {
                 if let Some(obj) = body.as_object_mut() {
-                    obj.insert("ctoken".to_string(), json!(ctoken.unwrap_or_default()));
+                    if let Some(ct) = ctoken.filter(|s| !s.is_empty()) {
+                        obj.insert("ctoken".to_string(), json!(ct));
+                    } else if is_hot {
+                        obj.insert("ctoken".to_string(), json!(""));
+                    }
                     obj.insert("ptoken".to_string(), json!(ptoken_clean));
                 }
             }
@@ -1022,6 +1262,7 @@ pub(crate) fn build_create_order_payload(
                 "token": token,
                 "buyer_info": serde_json::to_string(buyer_info).unwrap_or_default(),
                 "clickPosition": click_position,
+                "again": 1,
                 "newRisk": true,
                 "requestSource": request_source,
                 "deviceId": device_id,
@@ -1029,10 +1270,15 @@ pub(crate) fn build_create_order_payload(
                 "count": count,
                 "timestamp": timestamp,
                 "order_type": 1,
+                "orderCreateUrl": CREATE_ORDER_V2_URL,
             });
-            if is_hot {
+            if include_hot_tokens {
                 if let Some(obj) = body.as_object_mut() {
-                    obj.insert("ctoken".to_string(), json!(ctoken.unwrap_or_default()));
+                    if let Some(ct) = ctoken.filter(|s| !s.is_empty()) {
+                        obj.insert("ctoken".to_string(), json!(ct));
+                    } else if is_hot {
+                        obj.insert("ctoken".to_string(), json!(""));
+                    }
                     obj.insert("ptoken".to_string(), json!(ptoken_clean));
                 }
             }
@@ -1053,6 +1299,7 @@ pub async fn create_order(
     token: &str,
     ptoken: &str,
     confirm_result: &ConfirmTicketResult,
+    pay_money_override: Option<i64>,
     is_hot: bool,
     biliticket: &BilibiliTicket,
     buyer_info: &Vec<BuyerInfo>,
@@ -1060,9 +1307,10 @@ pub async fn create_order(
     need_retry: bool,
     fast_mode: bool,
     screen_size: Option<(u32, u32)>,
-) -> Result<Value, i32> {
+) -> Result<Value, CreateOrderFailure> {
     let ptoken_clean = ptoken.replace('=', "");
-    let base_url = "https://show.bilibili.com/api/ticket/order/createV2";
+    let use_hot_tokens = is_hot || !ptoken_clean.is_empty();
+    let base_url = CREATE_ORDER_V2_URL;
 
     let position_type = if need_retry && is_mobile {
         ClickPositionType::RetryButton
@@ -1089,7 +1337,7 @@ pub async fn create_order(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let ctoken = if is_hot {
+    let ctoken = if use_hot_tokens {
         Some(
             cpdd.lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1102,6 +1350,8 @@ pub async fn create_order(
     let device_id = cookie_manager
         .get_cookie("deviceFingerprint")
         .unwrap_or_default();
+
+    let effective_pay_money = pay_money_override.unwrap_or(confirm_result.pay_money);
 
     let data = build_create_order_payload(
         project_id,
@@ -1117,17 +1367,18 @@ pub async fn create_order(
         click_position,
         is_mobile,
         &device_id,
-        confirm_result.pay_money,
+        effective_pay_money,
         confirm_result.count,
         timestamp,
-    )?;
+    )
+    .map_err(CreateOrderFailure::from_code)?;
 
     log::debug!("抢票data：{:?}", data);
 
     let req = cookie_manager
         .post_with_headers_h2(base_url, input_risk_header)
         .await;
-    let req = if is_hot {
+    let req = if use_hot_tokens {
         req.query(&[("project_id", project_id), ("ptoken", ptoken_clean.as_str())])
     } else {
         req.query(&[("project_id", project_id)])
@@ -1135,29 +1386,48 @@ pub async fn create_order(
 
     let response = req.json(&data).send().await.map_err(|e| {
         log::error!("createV2 网络请求失败: {}", e);
-        ERR_NETWORK
+        CreateOrderFailure::from_code(ERR_NETWORK)
     })?;
 
     log::debug!("createV2 实际协议版本: {:?}", response.version());
     if response.status() != 200 {
         log::error!("createV2 HTTP 失败: {}", response.status());
-        return Err(response.status().as_u16() as i32);
+        return Err(CreateOrderFailure::from_code(
+            response.status().as_u16() as i32
+        ));
     }
 
     let text = response.text().await.map_err(|e| {
         log::error!("createV2 获取响应文本失败: {}", e);
-        ERR_NETWORK
+        CreateOrderFailure::from_code(ERR_NETWORK)
     })?;
     log::debug!("createV2 原始响应: {}", text);
 
     let value: Value = serde_json::from_str(&text).map_err(|e| {
         log::error!("createV2 解析响应文本失败: {}", e);
-        ERR_PARSE
+        CreateOrderFailure::from_code(ERR_PARSE)
     })?;
 
     if let Some((err_code, msg)) = extract_api_error(&value) {
         log::debug!("createV2 返回错误码({}): {}", err_code, msg);
-        return Err(err_code as i32);
+        let updated_pay_money = if err_code == 100034 {
+            extract_updated_pay_money(&value)
+        } else {
+            None
+        };
+        return Err(CreateOrderFailure {
+            code: err_code as i32,
+            message: msg,
+            updated_pay_money,
+        });
+    }
+
+    if is_create_order_degraded_response(&value) {
+        log::info!("createV2 返回 defaultBBR 降级空包，视为未成单继续重试");
+        return Err(CreateOrderFailure::from_code_msg(
+            ERR_DEGRADED_BBR,
+            extract_api_message(&value),
+        ));
     }
 
     Ok(value)
@@ -1202,10 +1472,73 @@ pub async fn check_fake_ticket(
         .text()
         .await
         .map_err(|e| format!("读取检测响应文本失败: {}", e))?;
+    log::debug!("check_fake_ticket 原始响应: {}", text);
 
     let data =
         serde_json::from_str::<Value>(&text).map_err(|e| format!("解析响应文本失败: {}", e))?;
     Ok(data)
+}
+
+async fn fetch_order_pay_param_from_url(
+    cookie_manager: Arc<CookieManager>,
+    endpoint_url: &str,
+    order_id: &str,
+) -> Result<CheckFakeResultData, PayParamError> {
+    let trimmed = order_id.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Err(PayParamError::Unavailable(
+            "订单号为空，无法查询支付参数".to_string(),
+        ));
+    }
+
+    // 显式使用桌面 PC 浏览器身份请求 getPayParam：
+    // 即使抢票阶段开启了 Android/Mobile 自定义 UA，也能让 B站返回 deviceType=1 的直扫 code_url，
+    // 而不是返回仅供移动端 H5 收银台使用的无 code_url 表单参数（deviceType=2）。
+    let referer = format!(
+        "https://show.bilibili.com/platform/orderDetail.html?order_id={}",
+        trimmed
+    );
+    let pc_cookie = build_pc_pay_cookie_header(&cookie_manager.get_all_cookies());
+    let mut headers: HashMap<&str, &str> = HashMap::new();
+    headers.insert("User-Agent", PC_PAY_USER_AGENT);
+    headers.insert("Referer", referer.as_str());
+    headers.insert("Origin", "https://show.bilibili.com");
+    if !pc_cookie.is_empty() {
+        headers.insert("Cookie", pc_cookie.as_str());
+    }
+
+    let response = cookie_manager
+        .get_with_headers(endpoint_url, headers)
+        .await
+        .query(&[("order_id", trimmed)])
+        .send()
+        .await
+        .map_err(|e| PayParamError::Unavailable(format!("getPayParam 网络请求失败: {}", e)))?;
+
+    if !response.status().is_success() {
+        return Err(PayParamError::Unavailable(format!(
+            "getPayParam 返回 HTTP {}",
+            response.status()
+        )));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| PayParamError::Unavailable(format!("读取 getPayParam 响应失败: {}", e)))?;
+    log::debug!("getPayParam 原始响应: {}", text);
+
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| PayParamError::Unavailable(format!("解析 getPayParam 响应失败: {}", e)))?;
+    parse_pay_param_response(&value)
+}
+
+/// 通过 `/api/ticket/order/getPayParam?order_id=...` 获取已创建订单的直扫支付二维码链接
+pub async fn fetch_order_pay_param(
+    cookie_manager: Arc<CookieManager>,
+    order_id: &str,
+) -> Result<CheckFakeResultData, PayParamError> {
+    fetch_order_pay_param_from_url(cookie_manager, GET_PAY_PARAM_URL, order_id).await
 }
 
 /// 点击位置类型枚举
@@ -1442,13 +1775,18 @@ mod tests {
         assert_eq!(payload["project_id"], json!(10001));
         assert_eq!(payload["screen_id"], json!(20002));
         assert_eq!(payload["sku_id"], json!(30003));
+        assert_eq!(payload["again"], json!(1));
+        assert_eq!(
+            payload["orderCreateUrl"],
+            json!("https://show.bilibili.com/api/ticket/order/createV2")
+        );
         assert_eq!(payload["ctoken"], json!("ctok_xyz"));
         assert_eq!(payload["ptoken"], json!("ptok_clean"));
         assert_eq!(payload["buyer"], json!("张三"));
         assert_eq!(payload["tel"], json!("13800138000"));
         assert_eq!(payload["deviceId"], json!(""));
 
-        // non-hot id_bind=0 should omit ctoken/ptoken
+        // non-hot id_bind=0 without ptoken should still carry again & orderCreateUrl, omitting ctoken/ptoken
         let cold_payload = build_create_order_payload(
             "10001",
             "20002",
@@ -1468,9 +1806,96 @@ mod tests {
             1700000000000,
         )
         .expect("cold id_bind=0 should build");
+        assert_eq!(cold_payload["again"], json!(1));
+        assert_eq!(
+            cold_payload["orderCreateUrl"],
+            json!("https://show.bilibili.com/api/ticket/order/createV2")
+        );
         assert!(cold_payload.get("ctoken").is_none());
         assert!(cold_payload.get("ptoken").is_none());
         assert_eq!(cold_payload["requestSource"], json!("pc-new"));
+
+        // non-hot project that still received a server ptoken must forward ptoken & ctoken
+        let dynamic_ptoken_payload = build_create_order_payload(
+            "10001",
+            "20002",
+            Some("30003"),
+            "tok_abc",
+            "ptok_from_prepare",
+            Some("ctok_dyn".to_string()),
+            false,
+            1,
+            None,
+            &[],
+            json!({}),
+            true,
+            "fp123",
+            9900,
+            1,
+            1700000000000,
+        )
+        .expect("dynamic ptoken payload should build");
+        assert_eq!(dynamic_ptoken_payload["ptoken"], json!("ptok_from_prepare"));
+        assert_eq!(dynamic_ptoken_payload["ctoken"], json!("ctok_dyn"));
+
+        // prepare payload includes buyer_info, ignoreRequestLimit and ticket_agent
+        let prepare_payload = build_prepare_order_payload(10001, 20002, 30003, 2, &[], "ctok_p");
+        assert_eq!(prepare_payload["ignoreRequestLimit"], json!(true));
+        assert_eq!(prepare_payload["ticket_agent"], json!(""));
+        assert_eq!(prepare_payload["buyer_info"], json!([]));
+        assert_eq!(prepare_payload["token"], json!("ctok_p"));
+        assert_eq!(prepare_payload["requestSource"], json!("neul-next"));
+
+        // degraded defaultBBR detection & 100034 pay_money extraction
+        assert!(is_create_order_degraded_response(&json!({
+            "errno": 0,
+            "msg": "defaultBBR fallback"
+        })));
+        assert!(!is_create_order_degraded_response(&json!({
+            "errno": 0,
+            "msg": ""
+        })));
+        assert_eq!(
+            extract_updated_pay_money(&json!({"errno": 100034, "data": {"pay_money": 18800}})),
+            Some(18800)
+        );
+        assert_eq!(
+            extract_updated_pay_money(&json!({"errno": 100034, "data": {"pay_money": 0}})),
+            None
+        );
+
+        // getPayParam parsing & orderDetail fallback URL
+        let top_level_pay = parse_pay_param_response(&json!({
+            "errno": 0,
+            "data": {"code_url": "https://qr.alipay.com/bax123", "sign": "sig_1"}
+        }))
+        .expect("top-level data.code_url should parse");
+        assert_eq!(top_level_pay.code_url, "https://qr.alipay.com/bax123");
+        assert_eq!(top_level_pay.sign, "sig_1");
+
+        let nested_pay = parse_pay_param_response(&json!({
+            "errno": 0,
+            "data": {"payParam": {"code_url": "weixin://wxpay/abc"}}
+        }))
+        .expect("nested data.payParam.code_url should parse");
+        assert_eq!(nested_pay.code_url, "weixin://wxpay/abc");
+
+        assert!(matches!(
+            parse_pay_param_response(&json!({"errno": 0, "data": {"code_url": ""}})),
+            Err(PayParamError::Unavailable(_))
+        ));
+        assert!(matches!(
+            parse_pay_param_response(&json!({"errno": 100018, "msg": "订单不存在"})),
+            Err(PayParamError::OrderNotFound { code: 100018, .. })
+        ));
+        assert!(matches!(
+            parse_pay_param_response(&json!({"errno": 99999, "msg": "仅支持APP支付"})),
+            Err(PayParamError::Unavailable(_))
+        ));
+        assert_eq!(
+            build_order_detail_fallback_url(" 8001478508219364 "),
+            "https://show.bilibili.com/platform/orderDetail.html?order_id=8001478508219364"
+        );
 
         // invalid numeric IDs fail fast with ERR_INVALID_PARAM (999)
         let bad = build_create_order_payload(
@@ -1693,6 +2118,85 @@ mod tests {
         assert_eq!(
             status,
             QrCodeLoginStatus::Success("SESSDATA=qr_ok_cookie".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_order_pay_param_forces_desktop_pc_ua_and_strips_mobile_source_cookies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local mock pay server");
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept getPayParam request");
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let raw_req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            let body = r#"{"errno":0,"msg":"","data":{"code_url":"https://pay.bilibili.com/payplatform-h5/qrpay.html?payToken=tok_ok","sign":"sig_pc"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+            raw_req
+        });
+
+        let mobile_ua = "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36";
+        let client = reqwest::Client::builder()
+            .user_agent(mobile_ua)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let cm = Arc::new(CookieManager::from_client(
+            Arc::new(client),
+            "SESSDATA=real_sess; DedeUserID=401924460; msource=bilibiliapp; mSource=bilibiliapp; kfcSource=bilibiliapp",
+        ));
+        cm.set_ua(mobile_ua);
+
+        let endpoint = format!("http://{}/api/ticket/order/getPayParam", addr);
+        let pay = fetch_order_pay_param_from_url(cm, &endpoint, "8001478555289364")
+            .await
+            .expect("mock getPayParam should return code_url");
+
+        let captured_req = server.await.unwrap();
+        let captured_lower = captured_req.to_ascii_lowercase();
+
+        assert_eq!(
+            pay.code_url,
+            "https://pay.bilibili.com/payplatform-h5/qrpay.html?payToken=tok_ok"
+        );
+        assert_eq!(pay.sign, "sig_pc");
+        assert!(
+            captured_lower.contains("windows nt 10.0; win64; x64"),
+            "must override mobile UA with desktop PC UA, got:\n{}",
+            captured_req
+        );
+        assert!(
+            !captured_lower.contains("android") && !captured_lower.contains("nexus 5"),
+            "must NOT send Android/Mobile UA to getPayParam, got:\n{}",
+            captured_req
+        );
+        assert!(
+            captured_lower.contains("referer: https://show.bilibili.com/platform/orderdetail.html?order_id=8001478555289364"),
+            "must send PC orderDetail Referer, got:\n{}",
+            captured_req
+        );
+        assert!(
+            captured_req.contains("SESSDATA=real_sess") && captured_req.contains("DedeUserID=401924460"),
+            "must preserve auth cookies, got:\n{}",
+            captured_req
+        );
+        assert!(
+            !captured_lower.contains("msource=") && !captured_lower.contains("kfcsource="),
+            "must strip mobile app source cookies, got:\n{}",
+            captured_req
         );
     }
 }

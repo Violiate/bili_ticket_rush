@@ -2,6 +2,7 @@ use common::taskmanager::{AddBuyerRequest, TaskRequest};
 use eframe::egui::{self, Color32, RichText, Stroke};
 
 use crate::app::{normalize_fullwidth_ascii, Myapp};
+use crate::windows::{bounded_window_sizes, show_resizable_body};
 
 #[derive(Default, Clone, Debug)]
 pub struct AddBuyerInput {
@@ -59,140 +60,163 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: &str) {
     let mut submit_clicked = false;
     let mut cancel_clicked = false;
 
+    let (default_sz, min_sz, max_sz) = bounded_window_sizes(ctx, 560.0, 430.0, 440.0, 320.0);
+
     egui::Window::new("添加购票人")
         .open(&mut window_open)
-        .default_size([560.0, 420.0])
+        .default_size(default_sz)
+        .min_width(min_sz[0])
+        .min_height(min_sz[1])
+        .resize(|r| r.max_size(max_sz))
+        .constrain(true)
         .resizable(true)
         .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading("添加实名购票人");
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(format!("目标账号: {} (UID: {})", account_name, account_uid))
-                        .color(ui.visuals().weak_text_color()),
-                );
-            });
-            ui.separator();
-
-            // 内联错误提示条
-            if let Some(ref err_msg) = app.add_buyer_error {
-                egui::Frame::none()
-                    .fill(if ui.visuals().dark_mode {
-                        Color32::from_rgb(60, 24, 24)
-                    } else {
-                        Color32::from_rgb(254, 242, 242)
-                    })
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(220, 68, 55)))
-                    .rounding(6.0)
-                    .inner_margin(10.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(err_msg)
-                                    .color(Color32::from_rgb(220, 68, 55))
-                                    .size(13.5),
-                            )
-                            .wrap(true),
-                        );
-                    });
-                ui.add_space(8.0);
-            }
-
             let editing_enabled = !app.add_buyer_submitting;
             let ime_composing = app.is_ime_composing();
-            ui.add_enabled_ui(editing_enabled, |ui| {
-                egui::Grid::new("add_buyer_form_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 14.0])
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("姓名:").size(15.0));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut app.add_buyer_input.name)
-                                .hint_text("请输入真实姓名")
-                                .desired_width(280.0),
+
+            show_resizable_body(
+                ui,
+                "add_buyer_scroll",
+                |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("添加实名购票人");
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "目标账号: {} (UID: {})",
+                                account_name, account_uid
+                            ))
+                            .color(ui.visuals().weak_text_color()),
                         );
-                        ui.end_row();
-
-                        ui.label(RichText::new("手机号:").size(15.0));
-                        let phone_resp = ui.add(
-                            egui::TextEdit::singleline(&mut app.add_buyer_input.phone)
-                                .hint_text("请输入手机号（仅数字）")
-                                .desired_width(280.0),
-                        );
-                        if (phone_resp.changed() || phone_resp.lost_focus())
-                            && (!ime_composing || phone_resp.lost_focus())
-                        {
-                            app.add_buyer_input.phone =
-                                normalize_fullwidth_ascii(&app.add_buyer_input.phone)
-                                    .chars()
-                                    .filter(|c| c.is_ascii_digit())
-                                    .take(15)
-                                    .collect();
-                        }
-                        ui.end_row();
-
-                        ui.label(RichText::new("证件类型:").size(15.0));
-                        id_type_selector(ui, &mut app.add_buyer_input.id_type);
-                        ui.end_row();
-
-                        ui.label(RichText::new("证件号码:").size(15.0));
-                        let id_resp = ui.add(
-                            egui::TextEdit::singleline(&mut app.add_buyer_input.id_number)
-                                .hint_text(get_id_hint(app.add_buyer_input.id_type))
-                                .desired_width(280.0),
-                        );
-                        if (id_resp.changed() || id_resp.lost_focus())
-                            && (!ime_composing || id_resp.lost_focus())
-                        {
-                            app.add_buyer_input.id_number =
-                                normalize_fullwidth_ascii(&app.add_buyer_input.id_number)
-                                    .chars()
-                                    .filter(|c| {
-                                        c.is_ascii_alphanumeric() || matches!(*c, '(' | ')' | '-')
-                                    })
-                                    .collect();
-                        }
-                        ui.end_row();
-
-                        ui.label("");
-                        ui.checkbox(&mut app.add_buyer_input.as_default_buyer, "设为默认购票人");
-                        ui.end_row();
                     });
-            });
+                    ui.separator();
+                    ui.add_space(4.0);
+                },
+                |ui| {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if app.add_buyer_submitting {
+                            ui.spinner();
+                            ui.label("正在提交购票人信息...");
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let save_label = if app.add_buyer_submitting {
+                                "提交中..."
+                            } else {
+                                "保存"
+                            };
+                            let save_btn = egui::Button::new(
+                                RichText::new(save_label)
+                                    .size(15.0)
+                                    .color(Color32::WHITE),
+                            )
+                            .min_size(egui::vec2(108.0, 36.0))
+                            .fill(Color32::from_rgb(59, 130, 246))
+                            .rounding(8.0);
 
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(8.0);
+                            if ui.add_enabled(!app.add_buyer_submitting, save_btn).clicked() {
+                                submit_clicked = true;
+                            }
 
-            ui.horizontal(|ui| {
-                if app.add_buyer_submitting {
-                    ui.spinner();
-                    ui.label("正在提交购票人信息...");
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let save_label = if app.add_buyer_submitting {
-                        "提交中..."
-                    } else {
-                        "保存"
-                    };
-                    let save_btn = egui::Button::new(
-                        RichText::new(save_label)
-                            .size(15.0)
-                            .color(Color32::WHITE),
-                    )
-                    .min_size(egui::vec2(108.0, 36.0))
-                    .fill(Color32::from_rgb(59, 130, 246))
-                    .rounding(8.0);
-
-                    if ui.add_enabled(!app.add_buyer_submitting, save_btn).clicked() {
-                        submit_clicked = true;
+                            if ui.button("取消").clicked() {
+                                cancel_clicked = true;
+                            }
+                        });
+                    });
+                },
+                |ui| {
+                    // 内联错误提示条
+                    if let Some(ref err_msg) = app.add_buyer_error {
+                        egui::Frame::none()
+                            .fill(if ui.visuals().dark_mode {
+                                Color32::from_rgb(60, 24, 24)
+                            } else {
+                                Color32::from_rgb(254, 242, 242)
+                            })
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(220, 68, 55)))
+                            .rounding(6.0)
+                            .inner_margin(10.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(err_msg)
+                                            .color(Color32::from_rgb(220, 68, 55))
+                                            .size(13.5),
+                                    )
+                                    .wrap(true),
+                                );
+                            });
+                        ui.add_space(8.0);
                     }
 
-                    if ui.button("取消").clicked() {
-                        cancel_clicked = true;
-                    }
-                });
-            });
+                    let input_w = (ui.available_width() - 120.0).clamp(180.0, 360.0);
+                    ui.add_enabled_ui(editing_enabled, |ui| {
+                        egui::Grid::new("add_buyer_form_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 14.0])
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("姓名:").size(15.0));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut app.add_buyer_input.name)
+                                        .hint_text("请输入真实姓名")
+                                        .desired_width(input_w),
+                                );
+                                ui.end_row();
+
+                                ui.label(RichText::new("手机号:").size(15.0));
+                                let phone_resp = ui.add(
+                                    egui::TextEdit::singleline(&mut app.add_buyer_input.phone)
+                                        .hint_text("请输入手机号（仅数字）")
+                                        .desired_width(input_w),
+                                );
+                                if (phone_resp.changed() || phone_resp.lost_focus())
+                                    && (!ime_composing || phone_resp.lost_focus())
+                                {
+                                    app.add_buyer_input.phone =
+                                        normalize_fullwidth_ascii(&app.add_buyer_input.phone)
+                                            .chars()
+                                            .filter(|c| c.is_ascii_digit())
+                                            .take(15)
+                                            .collect();
+                                }
+                                ui.end_row();
+
+                                ui.label(RichText::new("证件类型:").size(15.0));
+                                id_type_selector(ui, &mut app.add_buyer_input.id_type);
+                                ui.end_row();
+
+                                ui.label(RichText::new("证件号码:").size(15.0));
+                                let id_resp = ui.add(
+                                    egui::TextEdit::singleline(&mut app.add_buyer_input.id_number)
+                                        .hint_text(get_id_hint(app.add_buyer_input.id_type))
+                                        .desired_width(input_w),
+                                );
+                                if (id_resp.changed() || id_resp.lost_focus())
+                                    && (!ime_composing || id_resp.lost_focus())
+                                {
+                                    app.add_buyer_input.id_number =
+                                        normalize_fullwidth_ascii(&app.add_buyer_input.id_number)
+                                            .chars()
+                                            .filter(|c| {
+                                                c.is_ascii_alphanumeric()
+                                                    || matches!(*c, '(' | ')' | '-')
+                                            })
+                                            .collect();
+                                }
+                                ui.end_row();
+
+                                ui.label("");
+                                ui.checkbox(
+                                    &mut app.add_buyer_input.as_default_buyer,
+                                    "设为默认购票人",
+                                );
+                                ui.end_row();
+                            });
+                    });
+                },
+            );
         });
 
     if submit_clicked {

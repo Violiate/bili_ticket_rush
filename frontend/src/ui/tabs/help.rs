@@ -120,16 +120,26 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let log_btn_label = if app.show_log_window {
+                "📜 收起实时日志"
+            } else {
+                "📜 打开实时日志窗口"
+            };
             let log_btn = egui::Button::new(
-                egui::RichText::new("打开实时日志窗口")
-                    .size(13.0)
+                egui::RichText::new(log_btn_label)
+                    .size(13.5)
+                    .strong()
                     .color(egui::Color32::WHITE),
             )
-            .fill(palette.slate)
-            .rounding(7.0)
-            .min_size(egui::vec2(124.0, 28.0));
+            .fill(if app.show_log_window {
+                egui::Color32::from_rgb(16, 152, 104)
+            } else {
+                palette.accent
+            })
+            .rounding(8.0)
+            .min_size(egui::vec2(146.0, 31.0));
             if ui.add(log_btn).clicked() {
-                app.show_log_window = true;
+                app.show_log_window = !app.show_log_window;
             }
 
             ui.add_space(8.0);
@@ -140,9 +150,9 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
                     .strong()
                     .color(egui::Color32::WHITE),
             )
-            .fill(palette.accent)
+            .fill(palette.slate)
             .rounding(7.0)
-            .min_size(egui::vec2(114.0, 28.0));
+            .min_size(egui::vec2(114.0, 31.0));
             if ui.add(account_btn).clicked() {
                 app.selected_tab = 2;
             }
@@ -206,7 +216,7 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
                         .inner_margin(egui::Margin::symmetric(8.0, 2.5))
                         .show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new(format!("v{}", app.version))
+                                egui::RichText::new(format!("v{}", app.display_version))
                                     .size(12.5)
                                     .strong()
                                     .color(palette.badge_text),
@@ -276,7 +286,7 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
                     ui,
                     "5. 常见问题与跨平台运行提示",
                     "• 支付超时提醒：抢票成功并弹出支付二维码后，请在订单有效期内（通常为 15 分钟）尽快扫码或在 B 站 App「会员购订单」中完成付款，超时订单会自动取消。\n\
-                     • 日志排查：如遇登录失败、风控提示或网络超时，可点击右上角「打开实时日志窗口」查看完整报错，程序同时会将本地日志文件保存在数据目录的 Log/ 文件夹中。\n\
+                     • 日志排查：如遇登录失败、风控提示或网络超时，可随时点击左侧栏底部「📜 打开实时日志」或页面右上角按钮查看完整报错，程序同时会将本地日志文件保存在数据目录的 Log/ 文件夹中。\n\
                      • 防风控建议：可在「设置 / 微调」中适当调大捡漏轮询间隔与下单重试间隔，避免短时间高频请求触发限制。\n\
                      • macOS / Linux 提示：macOS 通过 .app 启动时会自动将数据保存在 ~/Library/Application Support/BiliTicketRush；Linux 若无硬件 OpenGL 3.3 驱动，可设置环境变量 BILI_FORCE_SOFTWARE_GL=1 启用软件渲染。",
                     &palette,

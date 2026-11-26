@@ -162,77 +162,369 @@ pub(crate) enum CreateOrderErrorAction {
     Fatal(String),
 }
 
+/// 防误判防陷阱：若未知错误码的消息包含瞬时/排队/重试/库存波动提示，绝不因消息内容误停抢票
+fn contains_retry_hint_message(msg: &str) -> bool {
+    const RETRY_HINTS: &[&str] = &[
+        "请重试",
+        "重试",
+        "稍后",
+        "稍候",
+        "拥堵",
+        "繁忙",
+        "排队",
+        "频繁",
+        "过快",
+        "限流",
+        "限速",
+        "库存不足",
+        "余票不足",
+        "售罄",
+        "已售完",
+        "无票",
+        "未开售",
+        "未到开票",
+        "暂未开售",
+        "未开始",
+        "暂不可购",
+        "即将开售",
+    ];
+    RETRY_HINTS.iter().any(|kw| msg.contains(kw))
+}
+
+/// 仅对未知错误码做极克制的高置信度致命消息识别（只拦截“绝对不可能通过重试变成功”的业务终止态）
+fn match_high_confidence_fatal_message(msg: &str) -> Option<&'static str> {
+    let trimmed = msg.trim();
+    if trimmed.is_empty() || contains_retry_hint_message(trimmed) {
+        return None;
+    }
+
+    // 1. 已有订单 / 超出每人限购（继续重试只会重复报错并增加账号风控风险）
+    const DUPLICATE_OR_LIMIT_PATTERNS: &[&str] = &[
+        "已存在购买订单",
+        "已存在订单",
+        "存在未支付订单",
+        "存在待支付订单",
+        "存在待付款订单",
+        "存在尚未完成订单",
+        "有尚未完成订单",
+        "重复下单",
+        "重复购买",
+        "重复订单",
+        "超过限购",
+        "超出限购",
+        "达到限购",
+        "已达限购",
+        "超过购买上限",
+        "超出购买上限",
+        "已达购买上限",
+    ];
+    if DUPLICATE_OR_LIMIT_PATTERNS
+        .iter()
+        .any(|kw| trimmed.contains(kw))
+        || (trimmed.contains("每人限购")
+            && (trimmed.contains("已存在")
+                || trimmed.contains("已购")
+                || trimmed.contains("已买")
+                || trimmed.contains("已达")
+                || trimmed.contains("超出")
+                || trimmed.contains("超过")
+                || trimmed.contains("重复")))
+    {
+        return Some("已存在购买订单或已达每人限购上限，请前往 B站会员购订单中心查看");
+    }
+
+    // 2. 登录失效 / 账号受限
+    const AUTH_FATAL_PATTERNS: &[&str] = &[
+        "请先登录",
+        "账号未登录",
+        "登录已过期",
+        "登录状态失效",
+        "账号已被封禁",
+    ];
+    if AUTH_FATAL_PATTERNS.iter().any(|kw| trimmed.contains(kw)) {
+        return Some("账号登录状态已失效或受限，请重新登录后再试");
+    }
+
+    // 3. 购票人 / 实名信息错误（不修改购票人信息重试永远失败）
+    const BUYER_FATAL_PATTERNS: &[&str] = &[
+        "购票人信息有误",
+        "购票人信息不完整",
+        "观演人信息有误",
+        "实名信息有误",
+        "实名认证未通过",
+        "未实名认证",
+        "只能选择一个购票人",
+    ];
+    if BUYER_FATAL_PATTERNS.iter().any(|kw| trimmed.contains(kw)) {
+        return Some("购票人或实名信息校验未通过，请重新核对购票人信息");
+    }
+
+    // 4. 活动永久结束 / 下架 / 票种不可售 / 明确无购票资格（严格排除未开售与售罄）
+    const ENDED_OR_INELIGIBLE_PATTERNS: &[&str] = &[
+        "票种不可售",
+        "项目不可售",
+        "场次不可售",
+        "票种已停售",
+        "票种已下架",
+        "活动已结束",
+        "项目已结束",
+        "演出已结束",
+        "项目已下架",
+        "已收摊",
+        "不在白名单",
+        "无购买资格",
+        "不符合购票条件",
+    ];
+    if ENDED_OR_INELIGIBLE_PATTERNS
+        .iter()
+        .any(|kw| trimmed.contains(kw))
+    {
+        return Some("当前票种/项目不可售或账号不符合购票资格");
+    }
+
+    None
+}
+
+/// 确认订单（`/api/ticket/order/confirmInfo`）失败的结构化分流：
+/// - 票种不可售（80110655 / 100017 / 高置信度文案）：定向模式立即终止；捡漏模式立即跳过当前票种不再原地重试
+/// - 项目级/账号级致命错误：全模式立即终止
+/// - token 失效：立即触发刷新 token，避免带过期 token 反复重试 4 次
+/// - 瞬时限流/网络波动：返回 ConfirmFailed 交由上层短退避重试
+pub(crate) fn classify_confirm_order_error(
+    failure: &ConfirmOrderFailure,
+    grab_mode: u8,
+) -> GrabOutcome {
+    let msg = failure.message.trim();
+
+    // Layer 1：已知错误码优先（不受消息文案干扰）
+    if let Some(code) = failure.code {
+        match code {
+            100001 | 100009 | 429 | 412 | 900001 | 219 | 221 | 3 => {
+                return GrabOutcome::ConfirmFailed;
+            }
+            100041 | 100044 | 100050 | 100051 | 900002 => {
+                return GrabOutcome::NeedRefreshToken;
+            }
+            80110655 | 100017 => {
+                if grab_mode == 2 {
+                    log::warn!(
+                        "捡漏模式遇到票种不可售({})：{}，立即跳过该票种继续检测其他票种",
+                        code,
+                        msg
+                    );
+                    return GrabOutcome::RetryLimitReached;
+                }
+                let detail = if msg.is_empty() {
+                    format!("当前票种不可售（错误码 {}），已停止任务", code)
+                } else {
+                    format!("{}（错误码 {}），当前票种不可售，已停止任务", msg, code)
+                };
+                return GrabOutcome::FatalError(detail);
+            }
+            100016 | 100039 => {
+                let detail = if msg.is_empty() {
+                    format!("当前项目/场次不可售或已停售（错误码 {}）", code)
+                } else {
+                    format!("{}（错误码 {}），已停止任务", msg, code)
+                };
+                return GrabOutcome::FatalError(detail);
+            }
+            100080 | 100082 => {
+                return GrabOutcome::FatalError(format!(
+                    "场次/项目/票种参数有误（错误码 {}），请重新提交任务",
+                    code
+                ));
+            }
+            100048 | 100079 | 100003 | 80110758 => {
+                let detail = if msg.is_empty() {
+                    format!(
+                        "已存在待付款或重复订单（错误码 {}），请前往 B站会员购订单中心查看",
+                        code
+                    )
+                } else {
+                    format!("{}（错误码 {}），请前往 B站会员购订单中心查看", msg, code)
+                };
+                return GrabOutcome::FatalError(detail);
+            }
+            83000004 | 209001 | 1 => {
+                let detail = if msg.is_empty() {
+                    format!("购票人配置不符合该项目要求（错误码 {}），请重新提交任务", code)
+                } else {
+                    format!("{}（错误码 {}），请重新核对购票人信息", msg, code)
+                };
+                return GrabOutcome::FatalError(detail);
+            }
+            _ => {}
+        }
+    }
+
+    // Layer 2：未知错误码（或仅靠文案）做防陷阱过滤 + 高置信度终止识别
+    if is_token_expired_message(msg) {
+        return GrabOutcome::NeedRefreshToken;
+    }
+
+    if !contains_retry_hint_message(msg) {
+        let is_sku_unavailable_msg = msg.contains("票种不可售")
+            || msg.contains("票种已停售")
+            || msg.contains("票种已下架");
+        if is_sku_unavailable_msg {
+            if grab_mode == 2 {
+                log::warn!("捡漏模式遇到票种不可售({})，立即跳过该票种", msg);
+                return GrabOutcome::RetryLimitReached;
+            }
+            let code_suffix = failure
+                .code
+                .map(|c| format!(" [错误码 {}]", c))
+                .unwrap_or_default();
+            return GrabOutcome::FatalError(format!(
+                "当前票种不可售：{}{}",
+                msg, code_suffix
+            ));
+        }
+
+        if let Some(reason) = match_high_confidence_fatal_message(msg) {
+            let code_suffix = failure
+                .code
+                .map(|c| format!(" [错误码 {}: {}]", c, msg))
+                .unwrap_or_else(|| format!(" ({})", msg));
+            return GrabOutcome::FatalError(format!("{}{}", reason, code_suffix));
+        }
+    }
+
+    GrabOutcome::ConfirmFailed
+}
+
+/// 对未知错误码检查是否为明确的 token 过期提示
+fn is_token_expired_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("token过期")
+        || lower.contains("token已过期")
+        || lower.contains("token失效")
+        || lower.contains("token无效")
+        || msg.contains("订单准备过期")
+}
+
 pub(crate) fn classify_create_order_error(
     code: i32,
+    msg: &str,
     default_delay: Duration,
 ) -> CreateOrderErrorAction {
+    // Layer 1：已知错误码严格按码表处理（绝不受消息文案干扰）
     match code {
-        100001 | 429 | 900001 => {
+        100001 | 429 | 900001 | 221 => {
             log::info!("B站限速({})，正常现象，稍后重试", code);
-            CreateOrderErrorAction::Retry(Duration::from_millis(300))
+            return CreateOrderErrorAction::Retry(Duration::from_millis(300));
         }
         100009 => {
             log::info!("当前票种库存不足");
-            CreateOrderErrorAction::Retry(Duration::from_millis(600))
+            return CreateOrderErrorAction::Retry(Duration::from_millis(600));
         }
-        211 => {
-            log::info!("很遗憾，差一点点抢到票，继续加油吧！");
-            CreateOrderErrorAction::Retry(default_delay)
+        211 | 219 => {
+            log::info!("下单未抢到({})，准备重试", code);
+            return CreateOrderErrorAction::Retry(default_delay);
+        }
+        ERR_DEGRADED_BBR => {
+            log::info!("B站返回降级空响应(defaultBBR)，快速重试");
+            return CreateOrderErrorAction::Retry(default_delay);
+        }
+        100034 => {
+            log::info!("票价校验差异(100034)，已同步金额并重试");
+            return CreateOrderErrorAction::Retry(Duration::from_millis(200));
         }
         3 => {
             log::info!("抢票速度过快，即将被硬控5秒，暂停4.8秒");
-            CreateOrderErrorAction::Retry(Duration::from_millis(4800))
+            return CreateOrderErrorAction::Retry(Duration::from_millis(4800));
         }
-        100041 | 100050 | 900002 => {
-            log::info!("token失效({})，即将重新获取token", code);
-            CreateOrderErrorAction::NeedRefreshToken
+        100041 | 100044 | 100050 | 100051 | 900002 => {
+            log::info!("token失效或需重新准备({})，即将重新获取token", code);
+            return CreateOrderErrorAction::NeedRefreshToken;
         }
-        100017 | 100016 => {
-            CreateOrderErrorAction::Fatal("当前项目/类型/场次已停售".to_string())
+        100017 | 100016 | 80110655 => {
+            let detail = if msg.trim().is_empty() {
+                format!("当前项目/票种/场次不可售或已停售（错误码 {}）", code)
+            } else {
+                format!("{}（错误码 {}），已停止任务", msg.trim(), code)
+            };
+            return CreateOrderErrorAction::Fatal(detail);
         }
-        1 => CreateOrderErrorAction::Fatal(
-            "超人请慢一点，这是仅限1人抢票的项目或抢票格式有误，请重新提交任务".to_string(),
-        ),
+        1 => {
+            return CreateOrderErrorAction::Fatal(
+                "超人请慢一点，这是仅限1人抢票的项目或抢票格式有误，请重新提交任务".to_string(),
+            );
+        }
         83000004 => {
-            CreateOrderErrorAction::Fatal("没有配置购票人信息，请重新配置".to_string())
+            return CreateOrderErrorAction::Fatal("没有配置购票人信息，请重新配置".to_string());
         }
-        100079 | 100003 => CreateOrderErrorAction::Fatal(
-            "购票人存在待付款订单，请前往支付或取消后重新下单".to_string(),
-        ),
-        100039 => CreateOrderErrorAction::Fatal("活动已收摊/停售，下次要快点哦".to_string()),
-        209001 => CreateOrderErrorAction::Fatal(
-            "当前项目只能选择一个购票人，不支持多选，请重新提交任务".to_string(),
-        ),
-        ERR_INVALID_PARAM => CreateOrderErrorAction::Fatal(
-            "程序内部传参错误（项目/场次/票种ID或购票人信息无效）".to_string(),
-        ),
-        ERR_ID_BIND_INVALID => CreateOrderErrorAction::Fatal(
-            "该项目实名绑定类型(id_bind)异常，请尝试重新提交任务".to_string(),
-        ),
+        100048 | 100079 | 100003 | 80110758 => {
+            let detail = if msg.trim().is_empty() {
+                "购票人存在待付款/重复订单，请前往会员购订单中心支付或取消后再下单".to_string()
+            } else {
+                format!("{}（错误码 {}），请前往 B站会员购订单中心查看", msg.trim(), code)
+            };
+            return CreateOrderErrorAction::Fatal(detail);
+        }
+        100039 => {
+            return CreateOrderErrorAction::Fatal("活动已收摊/停售，下次要快点哦".to_string());
+        }
+        209001 => {
+            return CreateOrderErrorAction::Fatal(
+                "当前项目只能选择一个购票人，不支持多选，请重新提交任务".to_string(),
+            );
+        }
+        ERR_INVALID_PARAM => {
+            return CreateOrderErrorAction::Fatal(
+                "程序内部传参错误（项目/场次/票种ID或购票人信息无效）".to_string(),
+            );
+        }
+        ERR_ID_BIND_INVALID => {
+            return CreateOrderErrorAction::Fatal(
+                "该项目实名绑定类型(id_bind)异常，请尝试重新提交任务".to_string(),
+            );
+        }
         ERR_NETWORK => {
             log::warn!("下单网络请求失败，准备重试...");
-            CreateOrderErrorAction::Retry(default_delay)
+            return CreateOrderErrorAction::Retry(default_delay);
         }
         ERR_PARSE => {
             log::warn!("下单响应解析失败，准备重试...");
-            CreateOrderErrorAction::Retry(default_delay)
+            return CreateOrderErrorAction::Retry(default_delay);
         }
         412 => {
             log::warn!("触发B站 412 风控拦截，放缓请求后重试");
-            CreateOrderErrorAction::Retry(Duration::from_millis(1200))
+            return CreateOrderErrorAction::Retry(Duration::from_millis(1200));
         }
         737 => {
             log::warn!("B站返回空数据(737)，将继续重试，若持续异常请取消任务");
-            CreateOrderErrorAction::Retry(default_delay)
+            return CreateOrderErrorAction::Retry(default_delay);
         }
-        _ => {
-            log::error!(
-                "下单失败，未知错误码：{}，将继续重试（可提 issue 上报）",
-                code
-            );
-            CreateOrderErrorAction::Retry(default_delay)
-        }
+        _ => {}
     }
+
+    // Layer 2：未知错误码时，先检查 token 过期与极克制的高置信度致命消息
+    if is_token_expired_message(msg) {
+        log::info!("未知错误码({})提示 token 失效({}), 重新获取 token", code, msg.trim());
+        return CreateOrderErrorAction::NeedRefreshToken;
+    }
+
+    if let Some(reason) = match_high_confidence_fatal_message(msg) {
+        return CreateOrderErrorAction::Fatal(format!(
+            "{} [错误码 {}: {}]",
+            reason,
+            code,
+            msg.trim()
+        ));
+    }
+
+    if msg.trim().is_empty() {
+        log::error!("下单失败，未知错误码：{}，将继续重试（可提 issue 上报）", code);
+    } else {
+        log::error!(
+            "下单失败，未知错误码({})：{}，将继续重试（可提 issue 上报）",
+            code,
+            msg.trim()
+        );
+    }
+    CreateOrderErrorAction::Retry(default_delay)
 }
 
 /// 将分（整数）格式化为带两位小数的元字符串（如 `9990` -> `"99.90"`, `50` -> `"0.50"`）
@@ -267,25 +559,86 @@ pub(crate) fn should_skip_by_words(text: &str, skip_words_lower: &[String]) -> b
     skip_words_lower.iter().any(|w| lowered.contains(w))
 }
 
+/// 订单状态核验（`/api/ticket/order/createstatus`）的结构化结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrderVerifyOutcome {
+    /// createstatus 明确成功且直接返回了支付二维码链接
+    ConfirmedWithPay(CheckFakeResultData),
+    /// createstatus 返回 errno=0 确认订单已创建，但未内联 payParam.code_url（需走 getPayParam 或订单详情页链接）
+    ConfirmedNeedsPayParam,
+    /// 异步队列仍在处理中（如 100012 / 排队中），应继续轮询
+    Pending(String),
+    /// createstatus 明确返回非 0 失败（如库存不足/订单不存在/回滚，属于真·假票）
+    Rejected { code: i64, msg: String },
+}
+
+pub(crate) fn classify_createstatus_response(
+    check_result: &serde_json::Value,
+    has_order_id: bool,
+) -> OrderVerifyOutcome {
+    if let Some((err_code, err_msg)) = extract_api_error(check_result) {
+        let is_pending = matches!(err_code, 100012 | 100001 | 900001 | 900002 | 429)
+            || err_msg.contains("排队")
+            || err_msg.contains("处理中")
+            || err_msg.contains("创建中")
+            || err_msg.contains("请稍候")
+            || err_msg.contains("拥堵");
+        if is_pending {
+            return OrderVerifyOutcome::Pending(format!("code={}, msg={}", err_code, err_msg));
+        }
+        return OrderVerifyOutcome::Rejected {
+            code: err_code,
+            msg: err_msg,
+        };
+    }
+
+    if let Some(data) = check_result.get("data").filter(|d| d.is_object()) {
+        if let Ok(analyze_result) = serde_json::from_value::<CheckFakeResult>(check_result.clone()) {
+            if !analyze_result.data.pay_param.code_url.trim().is_empty() {
+                return OrderVerifyOutcome::ConfirmedWithPay(analyze_result.data.pay_param);
+            }
+        }
+        // 兼容部分接口直接在 data.code_url 返回支付链接的情况
+        if let Some(direct_url) = data
+            .get("code_url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let sign = data
+                .get("sign")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            return OrderVerifyOutcome::ConfirmedWithPay(CheckFakeResultData {
+                sign,
+                code_url: direct_url.to_string(),
+            });
+        }
+        // errno == 0 且有有效订单号：B站已确认订单存在，仅未在 createstatus 内联 code_url
+        if has_order_id {
+            return OrderVerifyOutcome::ConfirmedNeedsPayParam;
+        }
+    } else if has_order_id {
+        // createstatus 返回 errno == 0 且 createV2 已返回真实 orderId（如新项目仅靠 getPayParam 取码）
+        return OrderVerifyOutcome::ConfirmedNeedsPayParam;
+    }
+
+    OrderVerifyOutcome::Pending("createstatus 未返回订单号与支付参数，等待确认".to_string())
+}
+
+#[cfg(test)]
 pub(crate) fn extract_verified_pay_param(
     check_result: &serde_json::Value,
 ) -> Result<CheckFakeResultData, String> {
-    if let Some((err_code, err_msg)) = extract_api_error(check_result) {
-        return Err(format!("code={}, msg={}", err_code, err_msg));
+    match classify_createstatus_response(check_result, false) {
+        OrderVerifyOutcome::ConfirmedWithPay(pay) => Ok(pay),
+        OrderVerifyOutcome::ConfirmedNeedsPayParam => {
+            Err("payParam.code_url 为空，需通过 getPayParam 获取".to_string())
+        }
+        OrderVerifyOutcome::Pending(reason) => Err(reason),
+        OrderVerifyOutcome::Rejected { code, msg } => Err(format!("code={}, msg={}", code, msg)),
     }
-
-    if !check_result.get("data").is_some_and(|d| d.is_object()) {
-        return Err("payParam.code_url 为空，订单支付信息尚未生成或为假票".to_string());
-    }
-
-    let analyze_result = serde_json::from_value::<CheckFakeResult>(check_result.clone())
-        .map_err(|e| format!("解析核验响应失败: {}", e))?;
-
-    if analyze_result.data.pay_param.code_url.trim().is_empty() {
-        return Err("payParam.code_url 为空，订单支付信息尚未生成或为假票".to_string());
-    }
-
-    Ok(analyze_result.data.pay_param)
 }
 
 pub(crate) fn is_transient_mode2_token_error(code: i64) -> bool {
@@ -1739,6 +2092,7 @@ async fn execute_grab_ticket_task(
                                     &local_grab_request.ticket_id,
                                     count,
                                     current_is_hot,
+                                    &buyer_info,
                                 ) => res,
                                 _ = wait_for_cancel(&cancel_flag, cancel_rx) => {
                                     log::info!("获取token期间任务已取消，退出捡漏模式");
@@ -2063,6 +2417,11 @@ async fn run_direct_grab_loop(
             return;
         }
 
+        let prepare_buyers: &[BuyerInfo] = if grab_ticket_req.biliticket.id_bind == 0 {
+            &[]
+        } else {
+            buyer_info.as_slice()
+        };
         let token_result = tokio::select! {
             res = get_ticket_token(
                 Arc::clone(&cookie_manager),
@@ -2072,6 +2431,7 @@ async fn run_direct_grab_loop(
                 ticket_id,
                 count,
                 is_hot,
+                prepare_buyers,
             ) => res,
             _ = wait_for_cancel(cancel_flag, cancel_rx) => {
                 log::info!("获取token过程中任务已取消，退出{}", mode_name);
@@ -2311,15 +2671,42 @@ async fn run_direct_grab_loop(
                             true,
                             "抢票失败，场次/项目/日期选择有误，请重新提交任务".to_string(),
                         ),
-                        100039 => (true, "抢票失败，该场次已停售，请重新提交任务".to_string()),
-                        ERR_INVALID_PARAM => (true, format!("参数错误: {}", risk_param.message)),
-                        _ => (
-                            false,
+                        100039 | 100016 | 100017 | 80110655 => (
+                            true,
                             format!(
-                                "获取token失败，错误代码: {}，错误信息：{}",
+                                "抢票失败，当前票种/场次不可售（错误码 {}: {}），已停止任务",
                                 risk_param.code, risk_param.message
                             ),
                         ),
+                        100048 | 100079 | 100003 | 80110758 => (
+                            true,
+                            format!(
+                                "{}（错误码 {}），请前往 B站会员购订单中心查看",
+                                risk_param.message, risk_param.code
+                            ),
+                        ),
+                        ERR_INVALID_PARAM => (true, format!("参数错误: {}", risk_param.message)),
+                        _ => {
+                            if let Some(fatal_reason) =
+                                match_high_confidence_fatal_message(&risk_param.message)
+                            {
+                                (
+                                    true,
+                                    format!(
+                                        "{} [错误码 {}: {}]",
+                                        fatal_reason, risk_param.code, risk_param.message
+                                    ),
+                                )
+                            } else {
+                                (
+                                    false,
+                                    format!(
+                                        "获取token失败，错误代码: {}，错误信息：{}",
+                                        risk_param.code, risk_param.message
+                                    ),
+                                )
+                            }
+                        }
                     };
                     log::error!("{}", reason);
                     if is_fatal {
@@ -2423,9 +2810,24 @@ async fn handle_grab_ticket(
             )
             .await
         }
-        Err(e) => {
-            log::error!("确认订单失败，原因：{}，正在重试...", e);
-            GrabOutcome::ConfirmFailed
+        Err(failure) => {
+            let outcome = classify_confirm_order_error(&failure, grab_ticket_req.grab_mode);
+            match &outcome {
+                GrabOutcome::ConfirmFailed => {
+                    log::error!("确认订单失败，原因：{}，正在重试...", failure);
+                }
+                GrabOutcome::NeedRefreshToken => {
+                    log::warn!("确认订单提示 token 失效({}), 准备刷新 token...", failure);
+                }
+                GrabOutcome::FatalError(reason) => {
+                    log::error!("确认订单遇到不可恢复错误，立即停止：{}", reason);
+                }
+                GrabOutcome::RetryLimitReached => {
+                    log::warn!("确认订单阶段已跳过不可售票种：{}", failure);
+                }
+                _ => {}
+            }
+            outcome
         }
     }
 }
@@ -2470,6 +2872,7 @@ async fn try_create_order(
 
     let mut order_retry_count: u32 = 0;
     let mut need_retry = false;
+    let mut pay_money_override: Option<i64> = None;
 
     loop {
         if is_cancelled(cancel_flag, cancel_rx) {
@@ -2488,6 +2891,7 @@ async fn try_create_order(
             token,
             ptoken,
             confirm_result,
+            pay_money_override,
             is_hot,
             &grab_ticket_req.biliticket,
             buyer_info,
@@ -2518,7 +2922,9 @@ async fn try_create_order(
                 );
 
                 let mut verified_pay_result: Option<CheckFakeResultData> = None;
+                let mut rejected_as_fake = false;
                 let mut last_check_err = String::new();
+                let has_order_id = !order_id_str.is_empty() && order_id_str != "0";
 
                 for poll in 1..=MAX_FAKE_CHECK_POLLS {
                     match check_fake_ticket(
@@ -2529,22 +2935,77 @@ async fn try_create_order(
                     )
                     .await
                     {
-                        Ok(check_result) => match extract_verified_pay_param(&check_result) {
-                            Ok(pay_param) => {
-                                verified_pay_result = Some(pay_param);
-                                break;
+                        Ok(check_result) => {
+                            match classify_createstatus_response(&check_result, has_order_id) {
+                                OrderVerifyOutcome::ConfirmedWithPay(pay_param) => {
+                                    verified_pay_result = Some(pay_param);
+                                    break;
+                                }
+                                OrderVerifyOutcome::ConfirmedNeedsPayParam => {
+                                    log::info!(
+                                        "createstatus 已确认订单 {} 创建成功，正在通过 getPayParam 获取支付二维码...",
+                                        order_id_str
+                                    );
+                                    match fetch_order_pay_param(
+                                        Arc::clone(&cookie_manager),
+                                        &order_id_str,
+                                    )
+                                    .await
+                                    {
+                                        Ok(pay_param) => {
+                                            verified_pay_result = Some(pay_param);
+                                        }
+                                        Err(PayParamError::OrderNotFound { code, message }) => {
+                                            rejected_as_fake = true;
+                                            last_check_err = format!(
+                                                "getPayParam 确认订单不存在({}): {}",
+                                                code, message
+                                            );
+                                            log::warn!(
+                                                "订单 {} 在 getPayParam 中不存在({})，判定为假票/已回滚，继续抢票",
+                                                order_id_str,
+                                                last_check_err
+                                            );
+                                        }
+                                        Err(PayParamError::Unavailable(pay_err)) => {
+                                            let fallback_url =
+                                                build_order_detail_fallback_url(&order_id_str);
+                                            log::warn!(
+                                                "订单 {} 已确认创建，但 getPayParam 未返回直扫二维码({})，已回退订单详情页链接: {}",
+                                                order_id_str,
+                                                pay_err,
+                                                fallback_url
+                                            );
+                                            verified_pay_result = Some(CheckFakeResultData {
+                                                sign: String::new(),
+                                                code_url: fallback_url,
+                                            });
+                                        }
+                                    }
+                                    break;
+                                }
+                                OrderVerifyOutcome::Rejected { code, msg } => {
+                                    rejected_as_fake = true;
+                                    last_check_err = format!("code={}, msg={}", code, msg);
+                                    log::warn!(
+                                        "订单核验明确返回未成单({}，订单号: {})，判定为假票/队列回滚，继续抢票",
+                                        last_check_err,
+                                        order_id_str
+                                    );
+                                    break;
+                                }
+                                OrderVerifyOutcome::Pending(reason) => {
+                                    last_check_err = reason;
+                                    log::warn!(
+                                        "订单核验第 {}/{} 次等待中({})，订单号: {}",
+                                        poll,
+                                        MAX_FAKE_CHECK_POLLS,
+                                        last_check_err,
+                                        order_id_str
+                                    );
+                                }
                             }
-                            Err(err_msg) => {
-                                last_check_err = err_msg;
-                                log::warn!(
-                                    "订单核验第 {}/{} 次未通过({})，订单号: {}",
-                                    poll,
-                                    MAX_FAKE_CHECK_POLLS,
-                                    last_check_err,
-                                    order_id_str
-                                );
-                            }
-                        },
+                        }
                         Err(e) => {
                             last_check_err = e.clone();
                             log::warn!(
@@ -2561,7 +3022,46 @@ async fn try_create_order(
                     }
                 }
 
+                // 若 createstatus 连续 5 次网络异常/Pending，但 createV2 已下发真实 orderId 且未被明确驳回，
+                // 再直接调一次 getPayParam 做权威兜底核验，杜绝真票被误判丢单。
+                if verified_pay_result.is_none() && !rejected_as_fake && has_order_id {
+                    match fetch_order_pay_param(Arc::clone(&cookie_manager), &order_id_str).await {
+                        Ok(pay_param) => {
+                            log::info!(
+                                "兜底调用 getPayParam 确认订单 {} 有效，获取支付链接成功！",
+                                order_id_str
+                            );
+                            verified_pay_result = Some(pay_param);
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "兜底 getPayParam 未确认订单 {}: {}（原核验原因: {}）",
+                                order_id_str,
+                                e,
+                                last_check_err
+                            );
+                        }
+                    }
+                }
+
                 if let Some(pay_result) = verified_pay_result {
+                    let price_cents = resolve_order_price_cents(confirm_result);
+                    let price_formatted = format_price_yuan(price_cents);
+                    common::record_log::log_order_success(format!(
+                        "下单成功！账号: {} | 项目: {} | 场次: {} | 票种: {} × {} 张 | 实付: ¥{} | 订单号: {}",
+                        account_name,
+                        confirm_result.project_name,
+                        confirm_result.screen_name,
+                        confirm_result.ticket_info.name,
+                        confirm_result.count,
+                        price_formatted,
+                        if order_id_str.is_empty() {
+                            "-"
+                        } else {
+                            &order_id_str
+                        },
+                    ));
+
                     let task_result = TaskResult::GrabTicketResult(GrabTicketResult {
                         task_id: task_id.to_string(),
                         uid,
@@ -2641,16 +3141,31 @@ async fn try_create_order(
                 }
                 order_retry_delay
             }
-            Err(code) => match classify_create_order_error(code, order_retry_delay) {
-                CreateOrderErrorAction::Retry(delay) => delay,
-                CreateOrderErrorAction::NeedRefreshToken => {
-                    return GrabOutcome::NeedRefreshToken;
+            Err(failure) => {
+                if failure.code == 100034 {
+                    if let Some(new_pay_money) = failure.updated_pay_money {
+                        log::info!(
+                            "检测到票价更新(100034)，自动将应付金额更新为 ¥{}",
+                            format_price_yuan(new_pay_money)
+                        );
+                        pay_money_override = Some(new_pay_money);
+                    }
                 }
-                CreateOrderErrorAction::Fatal(reason) => {
-                    log::error!("{}", reason);
-                    return GrabOutcome::FatalError(reason);
+                match classify_create_order_error(
+                    failure.code,
+                    &failure.message,
+                    order_retry_delay,
+                ) {
+                    CreateOrderErrorAction::Retry(delay) => delay,
+                    CreateOrderErrorAction::NeedRefreshToken => {
+                        return GrabOutcome::NeedRefreshToken;
+                    }
+                    CreateOrderErrorAction::Fatal(reason) => {
+                        log::error!("{}", reason);
+                        return GrabOutcome::FatalError(reason);
+                    }
                 }
-            },
+            }
         };
 
         order_retry_count += 1;
@@ -2980,41 +3495,127 @@ mod tests {
     fn grab_outcome_and_error_classification_logic() {
         let default_delay = Duration::from_millis(400);
 
-        // Token refresh triggers
-        for code in [100041, 100050, 900002] {
+        // Token refresh triggers (including 100051 prepare expired & 100044 risk)
+        for code in [100041, 100044, 100050, 100051, 900002] {
             assert_eq!(
-                classify_create_order_error(code, default_delay),
+                classify_create_order_error(code, "", default_delay),
                 CreateOrderErrorAction::NeedRefreshToken
             );
         }
 
-        // Fast-fail fatal errors including ERR_INVALID_PARAM (999)
-        for code in [100017, 100016, 1, 83000004, 100079, 100003, 100039, 209001, ERR_INVALID_PARAM, ERR_ID_BIND_INVALID] {
+        // Fast-fail fatal errors including newly observed 80110758, 80110655, 100048 & ERR_INVALID_PARAM (999)
+        for code in [
+            100017,
+            100016,
+            80110655,
+            1,
+            83000004,
+            100048,
+            100079,
+            100003,
+            80110758,
+            100039,
+            209001,
+            ERR_INVALID_PARAM,
+            ERR_ID_BIND_INVALID,
+        ] {
             assert!(matches!(
-                classify_create_order_error(code, default_delay),
+                classify_create_order_error(code, "", default_delay),
                 CreateOrderErrorAction::Fatal(_)
             ));
         }
 
-        // Distinct single sleep durations (no double sleeps, ERR_NETWORK distinct from 412)
+        // Retryable protocol error codes (219, 221, 100034, ERR_DEGRADED_BBR)
         assert_eq!(
-            classify_create_order_error(100001, default_delay),
+            classify_create_order_error(221, "", default_delay),
             CreateOrderErrorAction::Retry(Duration::from_millis(300))
         );
         assert_eq!(
-            classify_create_order_error(100009, default_delay),
+            classify_create_order_error(219, "", default_delay),
+            CreateOrderErrorAction::Retry(default_delay)
+        );
+        assert_eq!(
+            classify_create_order_error(ERR_DEGRADED_BBR, "", default_delay),
+            CreateOrderErrorAction::Retry(default_delay)
+        );
+        assert_eq!(
+            classify_create_order_error(100034, "", default_delay),
+            CreateOrderErrorAction::Retry(Duration::from_millis(200))
+        );
+
+        // Layer 1 known retryable codes MUST NOT be overridden even if message contains trap text
+        assert_eq!(
+            classify_create_order_error(900001, "已存在购买订单（假陷阱测试）", default_delay),
+            CreateOrderErrorAction::Retry(Duration::from_millis(300))
+        );
+        assert_eq!(
+            classify_create_order_error(100009, "超出限购（假陷阱测试）", default_delay),
+            CreateOrderErrorAction::Retry(Duration::from_millis(600))
+        );
+
+        // Layer 2 unknown errno + high-confidence fatal messages MUST stop immediately
+        for fatal_msg in [
+            "该项目每人限购1张，已存在购买订单",
+            "您的账号存在待支付订单，请勿重复下单",
+            "已达购买上限",
+            "请先登录",
+            "购票人信息有误",
+            "活动已结束",
+            "您不在白名单内，无购买资格",
+        ] {
+            assert!(
+                matches!(
+                    classify_create_order_error(99998888, fatal_msg, default_delay),
+                    CreateOrderErrorAction::Fatal(_)
+                ),
+                "unknown errno with fatal msg {:?} should stop",
+                fatal_msg
+            );
+        }
+
+        // Layer 2 anti-trap guard: unknown errno with retry hints or pre-sale hints MUST continue retrying
+        for safe_retry_msg in [
+            "前方拥堵，请重试",
+            "系统繁忙，请稍后再试",
+            "库存不足，已达上限请重试",
+            "项目未开售，每人限购1张",
+            "每人限购1张，暂不可购",
+            "当前排队人数过多，请稍候",
+            "未知临时错误",
+        ] {
+            assert_eq!(
+                classify_create_order_error(99998888, safe_retry_msg, default_delay),
+                CreateOrderErrorAction::Retry(default_delay),
+                "unknown errno with transient/ambiguous msg {:?} must NOT false-stop",
+                safe_retry_msg
+            );
+        }
+
+        // Layer 2 unknown errno with token expired message triggers token refresh
+        assert_eq!(
+            classify_create_order_error(99998888, "订单准备过期，token已过期", default_delay),
+            CreateOrderErrorAction::NeedRefreshToken
+        );
+
+        // Distinct single sleep durations (no double sleeps, ERR_NETWORK distinct from 412)
+        assert_eq!(
+            classify_create_order_error(100001, "", default_delay),
+            CreateOrderErrorAction::Retry(Duration::from_millis(300))
+        );
+        assert_eq!(
+            classify_create_order_error(100009, "", default_delay),
             CreateOrderErrorAction::Retry(Duration::from_millis(600))
         );
         assert_eq!(
-            classify_create_order_error(3, default_delay),
+            classify_create_order_error(3, "", default_delay),
             CreateOrderErrorAction::Retry(Duration::from_millis(4800))
         );
         assert_eq!(
-            classify_create_order_error(412, default_delay),
+            classify_create_order_error(412, "", default_delay),
             CreateOrderErrorAction::Retry(Duration::from_millis(1200))
         );
         assert_eq!(
-            classify_create_order_error(ERR_NETWORK, default_delay),
+            classify_create_order_error(ERR_NETWORK, "", default_delay),
             CreateOrderErrorAction::Retry(default_delay)
         );
 
@@ -3031,36 +3632,118 @@ mod tests {
             GrabOutcome::FatalError("err".into()),
             GrabOutcome::FatalError("err".into())
         );
+
+        // ConfirmInfo structured classification: 80110655 ("票种不可售") stops immediately in Mode 0/1,
+        // skips only the current SKU in Mode 2, and never loops blindly.
+        let unsellable = ConfirmOrderFailure {
+            code: Some(80110655),
+            message: "票种不可售".to_string(),
+        };
+        assert!(matches!(
+            classify_confirm_order_error(&unsellable, 0),
+            GrabOutcome::FatalError(_)
+        ));
+        assert!(matches!(
+            classify_confirm_order_error(&unsellable, 1),
+            GrabOutcome::FatalError(_)
+        ));
+        assert_eq!(
+            classify_confirm_order_error(&unsellable, 2),
+            GrabOutcome::RetryLimitReached
+        );
+
+        // Unknown errno with "票种不可售" also stops in Mode 0/1 and skips SKU in Mode 2
+        let unknown_unsellable = ConfirmOrderFailure {
+            code: Some(80999999),
+            message: "票种不可售".to_string(),
+        };
+        assert!(matches!(
+            classify_confirm_order_error(&unknown_unsellable, 0),
+            GrabOutcome::FatalError(_)
+        ));
+        assert_eq!(
+            classify_confirm_order_error(&unknown_unsellable, 2),
+            GrabOutcome::RetryLimitReached
+        );
+
+        // Anti-trap guard on confirmInfo: transient/retryable codes and retry-hint messages keep retrying
+        let rate_limit_trap = ConfirmOrderFailure {
+            code: Some(900001),
+            message: "票种不可售（陷阱测试）".to_string(),
+        };
+        assert_eq!(
+            classify_confirm_order_error(&rate_limit_trap, 0),
+            GrabOutcome::ConfirmFailed
+        );
+        let presale_msg = ConfirmOrderFailure {
+            code: Some(80999999),
+            message: "该票种未开售，请稍后重试".to_string(),
+        };
+        assert_eq!(
+            classify_confirm_order_error(&presale_msg, 0),
+            GrabOutcome::ConfirmFailed
+        );
+        let expired_tok = ConfirmOrderFailure {
+            code: Some(100051),
+            message: "订单准备过期".to_string(),
+        };
+        assert_eq!(
+            classify_confirm_order_error(&expired_tok, 0),
+            GrabOutcome::NeedRefreshToken
+        );
     }
 
     #[test]
-    fn extract_verified_pay_param_rejects_empty_or_null_pay_param() {
-        let empty_data = extract_verified_pay_param(&json!({"errno": 0, "data": {}}));
-        assert!(empty_data.is_err());
-        assert!(empty_data.unwrap_err().contains("payParam.code_url"));
-
-        let null_data = extract_verified_pay_param(&json!({"errno": 0, "data": null}));
-        assert!(null_data.is_err());
-        assert!(null_data.unwrap_err().contains("payParam.code_url"));
-
-        let empty_code_url = extract_verified_pay_param(&json!({
+    fn extract_verified_pay_param_and_createstatus_classification() {
+        // Without orderId: empty/null payParam is not immediately confirmed
+        assert!(extract_verified_pay_param(&json!({"errno": 0, "data": {}})).is_err());
+        assert!(extract_verified_pay_param(&json!({"errno": 0, "data": null})).is_err());
+        assert!(extract_verified_pay_param(&json!({
             "errno": 0,
             "data": {"payParam": {"code_url": ""}}
-        }));
-        assert!(empty_code_url.is_err());
-        assert!(empty_code_url.unwrap_err().contains("payParam.code_url"));
-
-        let blank_code_url = extract_verified_pay_param(&json!({
+        }))
+        .is_err());
+        assert!(extract_verified_pay_param(&json!({
             "errno": 0,
             "data": {"payParam": {"code_url": "   "}}
-        }));
-        assert!(blank_code_url.is_err());
+        }))
+        .is_err());
 
-        let api_err = extract_verified_pay_param(&json!({
-            "errno": 100001,
-            "msg": "排队中"
-        }));
-        assert!(api_err.is_err());
+        // Real ticket with valid orderId where createstatus returns errno=0 without inline payParam.code_url
+        // MUST be classified as ConfirmedNeedsPayParam (never misjudged as fake ticket!)
+        assert_eq!(
+            classify_createstatus_response(&json!({"errno": 0, "data": {}}), true),
+            OrderVerifyOutcome::ConfirmedNeedsPayParam
+        );
+        assert_eq!(
+            classify_createstatus_response(
+                &json!({"errno": 0, "data": {"payParam": {"code_url": ""}}}),
+                true
+            ),
+            OrderVerifyOutcome::ConfirmedNeedsPayParam
+        );
+
+        // Pending async queue status keeps polling
+        assert!(matches!(
+            classify_createstatus_response(
+                &json!({"errno": 100012, "msg": "订单创建中，请稍候"}),
+                true
+            ),
+            OrderVerifyOutcome::Pending(_)
+        ));
+        assert!(matches!(
+            classify_createstatus_response(&json!({"errno": 100001, "msg": "排队中"}), true),
+            OrderVerifyOutcome::Pending(_)
+        ));
+
+        // Explicit server rejection (true fake ticket / async rollback) returns Rejected immediately
+        assert_eq!(
+            classify_createstatus_response(&json!({"errno": 100009, "msg": "库存不足"}), true),
+            OrderVerifyOutcome::Rejected {
+                code: 100009,
+                msg: "库存不足".to_string()
+            }
+        );
 
         let valid = extract_verified_pay_param(&json!({
             "errno": 0,

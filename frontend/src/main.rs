@@ -7,6 +7,7 @@ use eframe::epaint::Vec2;
 
 mod app;
 mod ui;
+mod version;
 mod windows;
 
 fn is_dir_writable(dir: &Path) -> bool {

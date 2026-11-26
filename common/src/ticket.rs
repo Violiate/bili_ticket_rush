@@ -106,7 +106,7 @@ pub struct CheckFakeResultParam {
     pub pay_param: CheckFakeResultData,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CheckFakeResultData {
     pub sign: String,
