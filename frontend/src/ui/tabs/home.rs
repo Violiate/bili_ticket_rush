@@ -1,8 +1,10 @@
 use eframe::egui;
 
-use crate::app::Myapp;
+use crate::app::{read_clipboard_text, AccountSwitch, Myapp};
+use crate::windows::confirm_ticket::{draw_inline_status_icon, pill_badge, subtle_action_button};
 use common::taskmanager::TaskManager_debug;
 use common::ticket::BilibiliTicket;
+use common::utils::save_config;
 
 struct HomePalette {
     card_fill: egui::Color32,
@@ -168,8 +170,17 @@ fn centered_block<R>(
     let effective_width = block_width.min(available).max(240.0);
     let left_pad = ((available - effective_width) * 0.5).max(0.0);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(left_pad);
-        add_contents(ui, effective_width)
+        ui.allocate_ui_with_layout(
+            egui::vec2(effective_width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(effective_width);
+                add_contents(ui, effective_width)
+            },
+        )
+        .inner
     })
     .inner
 }
@@ -180,10 +191,144 @@ fn ticket_input_area(
     card_width: f32,
     palette: &HomePalette,
 ) {
-    let input_response = styled_ticket_input(ui, &mut app.ticket_id, card_width, palette);
+    let mut paste_only = false;
+    let mut paste_and_grab = false;
+    let input_response = styled_ticket_input(
+        ui,
+        &mut app.ticket_id,
+        card_width,
+        palette,
+        &mut paste_only,
+        &mut paste_and_grab,
+    );
     let enter_pressed = input_response.lost_focus()
         && !app.is_ime_composing()
         && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+    if paste_only || paste_and_grab {
+        match read_clipboard_text() {
+            Some(clip) => {
+                app.ticket_id = clip;
+            }
+            None => {
+                app.show_info("剪贴板中暂无可用文本");
+                paste_and_grab = false;
+            }
+        }
+    }
+
+    // 粘贴了完整票务链接时，在输入框正下方居中对齐展示高质感识别状态条
+    let raw_trimmed = app.ticket_id.trim().to_string();
+    if !raw_trimmed.is_empty() && !raw_trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        ui.add_space(7.0);
+        let dark_mode = ui.visuals().dark_mode;
+        let mut replace_with_pid: Option<String> = None;
+        centered_block(ui, card_width, |ui, effective_w| {
+            let inner_bar_w = (effective_w - 24.0).max(200.0);
+            match parse_project_id(&raw_trimmed) {
+                Ok(pid) => {
+                    let (bg, border, green_fg, badge_bg) = if dark_mode {
+                        (
+                            egui::Color32::from_rgb(20, 48, 36),
+                            egui::Color32::from_rgb(34, 128, 86),
+                            egui::Color32::from_rgb(74, 222, 128),
+                            egui::Color32::from_rgb(28, 72, 52),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(236, 253, 245),
+                            egui::Color32::from_rgb(167, 243, 208),
+                            egui::Color32::from_rgb(16, 150, 92),
+                            egui::Color32::from_rgb(209, 250, 229),
+                        )
+                    };
+                    egui::Frame::none()
+                        .fill(bg)
+                        .stroke(egui::Stroke::new(1.0, border))
+                        .rounding(9.0)
+                        .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                        .show(ui, |ui| {
+                            ui.set_width(inner_bar_w);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 7.0;
+                                draw_inline_status_icon(ui, true, green_fg, egui::Color32::WHITE);
+                                ui.label(
+                                    egui::RichText::new("已从链接识别项目")
+                                        .size(12.5)
+                                        .color(green_fg),
+                                );
+                                pill_badge(
+                                    ui,
+                                    &format!("ID {}", pid),
+                                    badge_bg,
+                                    green_fg,
+                                );
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if subtle_action_button(
+                                            ui,
+                                            "转为纯 ID",
+                                            badge_bg,
+                                            border,
+                                            green_fg,
+                                        )
+                                        .on_hover_text("将输入框中的长链接精简替换为纯数字项目 ID")
+                                        .clicked()
+                                        {
+                                            replace_with_pid = Some(pid);
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                }
+                Err(err) => {
+                    let (bg, border, red_fg) = if dark_mode {
+                        (
+                            egui::Color32::from_rgb(56, 26, 28),
+                            egui::Color32::from_rgb(148, 52, 56),
+                            egui::Color32::from_rgb(248, 113, 113),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(254, 242, 242),
+                            egui::Color32::from_rgb(252, 165, 165),
+                            egui::Color32::from_rgb(212, 52, 48),
+                        )
+                    };
+                    egui::Frame::none()
+                        .fill(bg)
+                        .stroke(egui::Stroke::new(1.0, border))
+                        .rounding(9.0)
+                        .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                        .show(ui, |ui| {
+                            ui.set_width(inner_bar_w);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 7.0;
+                                draw_inline_status_icon(ui, false, red_fg, egui::Color32::WHITE);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(err).size(12.2).color(red_fg),
+                                    )
+                                    .wrap(true),
+                                );
+                            });
+                        });
+                }
+            }
+        });
+        if let Some(pid) = replace_with_pid {
+            app.ticket_id = pid;
+        }
+    }
+
+    // 最近项目历史胶囊：一键回填或双击开抢
+    if !app.custom_config.recent_projects.is_empty() {
+        ui.add_space(8.0);
+        render_recent_projects_bar(ui, app, card_width, palette, &mut paste_and_grab);
+    }
 
     ui.add_space(14.0);
     styled_selection_area(ui, app, card_width, palette);
@@ -191,12 +336,144 @@ fn ticket_input_area(
 
     let grab_clicked = styled_grab_button(ui, palette).clicked();
 
-    if enter_pressed || grab_clicked {
+    if enter_pressed || grab_clicked || paste_and_grab {
         trigger_start_grab(app);
     }
 }
 
-fn trigger_start_grab(app: &mut Myapp) {
+fn render_recent_projects_bar(
+    ui: &mut egui::Ui,
+    app: &mut Myapp,
+    card_width: f32,
+    palette: &HomePalette,
+    start_immediately: &mut bool,
+) {
+    let mut picked_id: Option<(String, bool)> = None;
+    let mut delete_id: Option<String> = None;
+    let mut clear_all = false;
+    let entries = app.custom_config.recent_projects.clone();
+
+    centered_block(ui, card_width, |ui, effective_w| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(effective_w, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(effective_w);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    ui.label(
+                        egui::RichText::new("最近项目：")
+                            .size(12.0)
+                            .color(palette.text_secondary),
+                    );
+                    for entry in &entries {
+                        let display_name = if entry.name.trim().is_empty() {
+                            entry.project_id.clone()
+                        } else {
+                            let chars: Vec<char> = entry.name.trim().chars().collect();
+                            let short: String = if chars.len() > 12 {
+                                format!("{}…", chars.iter().take(12).collect::<String>())
+                            } else {
+                                chars.into_iter().collect()
+                            };
+                            format!("{} ({})", short, entry.project_id)
+                        };
+                        let is_current = parse_project_id(&app.ticket_id)
+                            .map(|id| id == entry.project_id)
+                            .unwrap_or(false);
+
+                        egui::Frame::none()
+                            .fill(if is_current {
+                                palette.accent.linear_multiply(0.16)
+                            } else {
+                                palette.mode_unselected_fill
+                            })
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                if is_current {
+                                    palette.accent
+                                } else {
+                                    palette.mode_unselected_border
+                                },
+                            ))
+                            .rounding(12.0)
+                            .inner_margin(egui::Margin::symmetric(8.0, 2.5))
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let label_resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(display_name)
+                                                .size(12.0)
+                                                .color(palette.text_primary),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(format!(
+                                        "{}\n单击填入 ID，双击直接开始抢票",
+                                        if entry.name.is_empty() {
+                                            &entry.project_id
+                                        } else {
+                                            &entry.name
+                                        }
+                                    ));
+                                if label_resp.double_clicked() {
+                                    picked_id = Some((entry.project_id.clone(), true));
+                                } else if label_resp.clicked() {
+                                    picked_id = Some((entry.project_id.clone(), false));
+                                }
+
+                                let del_resp = ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new("×")
+                                                .size(12.0)
+                                                .color(palette.text_secondary),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text("移除此条历史");
+                                if del_resp.clicked() {
+                                    delete_id = Some(entry.project_id.clone());
+                                }
+                            });
+                    }
+                    if entries.len() > 1
+                        && subtle_action_button(
+                            ui,
+                            "清空",
+                            palette.mode_unselected_fill,
+                            palette.mode_unselected_border,
+                            palette.text_secondary,
+                        )
+                        .on_hover_text("清空全部最近项目记录")
+                        .clicked()
+                    {
+                        clear_all = true;
+                    }
+                });
+            },
+        );
+    });
+
+    if let Some((pid, double_clicked)) = picked_id {
+        app.ticket_id = pid;
+        if double_clicked {
+            *start_immediately = true;
+        }
+    }
+    if let Some(pid) = delete_id {
+        app.custom_config.remove_recent_project(&pid);
+        let _ = save_config(&mut app.config, None, Some(&app.custom_config), None);
+    } else if clear_all {
+        app.custom_config.recent_projects.clear();
+        let _ = save_config(&mut app.config, None, Some(&app.custom_config), None);
+    }
+}
+
+pub(crate) fn trigger_start_grab(app: &mut Myapp) {
     let raw_input = app.ticket_id.clone();
     let project_id = match parse_project_id(&raw_input) {
         Ok(id) => id,
@@ -294,29 +571,89 @@ fn styled_ticket_input(
     text: &mut String,
     card_width: f32,
     palette: &HomePalette,
+    paste_only: &mut bool,
+    paste_and_grab: &mut bool,
 ) -> egui::Response {
     centered_block(ui, card_width, |ui, effective_w| {
         egui::Frame::none()
             .fill(palette.input_fill)
             .rounding(10.0)
             .stroke(egui::Stroke::new(1.0, palette.input_border))
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .inner_margin(egui::Margin::symmetric(12.0, 7.0))
             .show(ui, |ui| {
-                ui.set_width((effective_w - 24.0).max(200.0));
+                let inner_total_w = (effective_w - 24.0).max(240.0);
+                ui.set_width(inner_total_w);
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
                     ui.label(egui::RichText::new("🎫").size(18.0));
 
-                    let input_w = (ui.available_width() - 4.0).max(160.0);
+                    let has_text = !text.is_empty();
+                    let right_btns_w = if has_text { 154.0 } else { 126.0 };
+                    let input_w = (ui.available_width() - right_btns_w).max(120.0);
                     let input = egui::TextEdit::singleline(text)
-                        .hint_text("输入项目 ID（如 100300）或粘贴完整票务链接")
+                        .hint_text("输入项目 ID 或粘贴票务链接")
                         .desired_width(input_w)
                         .text_color(palette.text_primary)
-                        .font(egui::FontId::new(16.0, egui::FontFamily::Proportional))
+                        .font(egui::FontId::new(15.5, egui::FontFamily::Proportional))
                         .margin(egui::vec2(4.0, 6.0))
                         .frame(false);
 
-                    ui.add(input)
+                    let resp = ui.add(input);
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        let quick_btn = egui::Button::new(
+                            egui::RichText::new("粘贴开抢")
+                                .size(12.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(palette.accent)
+                        .rounding(6.0)
+                        .min_size(egui::vec2(66.0, 26.0));
+                        if ui
+                            .add(quick_btn)
+                            .on_hover_text("一键读取剪贴板中的票务链接/ID并立即进入选票")
+                            .clicked()
+                        {
+                            *paste_and_grab = true;
+                        }
+
+                        let paste_btn = egui::Button::new(
+                            egui::RichText::new("粘贴")
+                                .size(12.0)
+                                .color(palette.text_primary),
+                        )
+                        .fill(palette.mode_unselected_fill)
+                        .rounding(6.0)
+                        .min_size(egui::vec2(44.0, 26.0));
+                        if ui
+                            .add(paste_btn)
+                            .on_hover_text("将剪贴板内容粘贴到输入框")
+                            .clicked()
+                        {
+                            *paste_only = true;
+                        }
+
+                        if has_text
+                            && ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("×")
+                                            .size(13.5)
+                                            .color(palette.text_secondary),
+                                    )
+                                    .frame(false)
+                                    .min_size(egui::vec2(22.0, 24.0)),
+                                )
+                                .on_hover_text("清空输入框")
+                                .clicked()
+                        {
+                            text.clear();
+                        }
+                    });
+
+                    resp
                 })
                 .inner
             })
@@ -359,6 +696,8 @@ fn account_selection(
     inner_w: f32,
     palette: &HomePalette,
 ) {
+    let mut enable_uid_now: Option<i64> = None;
+
     ui.vertical(|ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
@@ -387,54 +726,170 @@ fn account_selection(
                     app.show_login_windows = true;
                 }
             } else {
-                let selected_account = app
-                    .account_manager
-                    .accounts
-                    .iter()
-                    .find(|a| Some(a.uid) == app.selected_account_uid)
-                    .cloned();
-
-                let selected_text = match &selected_account {
-                    Some(account) => format_account_option(account.name.as_str(), account.uid, account.is_active),
-                    None => "请选择账号".to_string(),
-                };
-
-                let combo_width = (inner_w - 110.0).clamp(180.0, 300.0);
-                egui::ComboBox::from_id_source("account_selector")
-                    .selected_text(selected_text)
-                    .width(combo_width)
-                    .show_ui(ui, |ui| {
-                        for account in &app.account_manager.accounts {
-                            let text = format_account_option(
-                                account.name.as_str(),
-                                account.uid,
-                                account.is_active,
-                            );
-                            let is_selected = Some(account.uid) == app.selected_account_uid;
-                            if ui.selectable_label(is_selected, text).clicked() {
-                                app.selected_account_uid = Some(account.uid);
-                            }
-                        }
-                    });
-
-                if let Some(account) = &selected_account {
-                    if !account.vip_label.trim().is_empty() {
-                        ui.label(
-                            egui::RichText::new(account.vip_label.trim())
-                                .size(12.5)
-                                .color(egui::Color32::from_rgb(251, 114, 153)),
-                        );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if subtle_action_button(
+                        ui,
+                        "默认购票人设置",
+                        palette.mode_unselected_fill,
+                        palette.mode_unselected_border,
+                        palette.text_secondary,
+                    )
+                    .on_hover_text("前往「设置」为每个账号预设最多 2 位默认购票人")
+                    .clicked()
+                    {
+                        app.selected_tab = 3;
                     }
-                    if !account.level.trim().is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("LV{}", account.level.trim()))
-                                .size(12.5)
-                                .color(egui::Color32::from_rgb(0, 161, 214)),
-                        );
-                    }
-                }
+                });
             }
         });
+
+        if !app.account_manager.accounts.is_empty() {
+            ui.add_space(8.0);
+            let acc_count = app.account_manager.accounts.len();
+            let gap = 10.0;
+            let card_each_w = if acc_count >= 2 && inner_w >= 380.0 {
+                ((inner_w - gap) * 0.5 - 20.0).max(150.0)
+            } else {
+                (inner_w - 20.0).max(180.0)
+            };
+
+            let accounts_snapshot: Vec<_> = app
+                .account_manager
+                .accounts
+                .iter()
+                .map(|a| {
+                    let def_ids = app.custom_config.default_buyers_for_uid(a.uid);
+                    let default_names: Vec<String> = if !app.custom_config.enable_default_buyers {
+                        Vec::new()
+                    } else if let Some(cached) = app.account_buyers_cache.get(&a.uid) {
+                        def_ids
+                            .iter()
+                            .filter_map(|id| cached.iter().find(|b| b.id == *id))
+                            .map(|b| b.name.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        a.uid,
+                        a.name.clone(),
+                        a.vip_label.clone(),
+                        a.level.clone(),
+                        a.is_active,
+                        def_ids.len(),
+                        default_names,
+                    )
+                })
+                .collect();
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(gap, 8.0);
+                for (uid, name, vip, level, is_active, def_cnt, def_names) in &accounts_snapshot {
+                    let is_selected = app.selected_account_uid == Some(*uid);
+                    let card_id = ui.id().with(("home_acc_pill", *uid));
+                    let fill = if is_selected {
+                        palette.accent.linear_multiply(0.14)
+                    } else {
+                        palette.mode_unselected_fill
+                    };
+                    let stroke = egui::Stroke::new(
+                        if is_selected { 1.6 } else { 1.0 },
+                        if is_selected {
+                            palette.accent
+                        } else {
+                            palette.mode_unselected_border
+                        },
+                    );
+
+                    let frame_resp = egui::Frame::none()
+                        .fill(fill)
+                        .stroke(stroke)
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.set_width(card_each_w);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 3.0;
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+                                    let (radio_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(14.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    let rp = ui.painter();
+                                    if is_selected {
+                                        rp.circle_filled(radio_rect.center(), 6.5, palette.accent);
+                                        rp.circle_filled(
+                                            radio_rect.center(),
+                                            2.6,
+                                            egui::Color32::WHITE,
+                                        );
+                                    } else {
+                                        rp.circle_stroke(
+                                            radio_rect.center(),
+                                            6.0,
+                                            egui::Stroke::new(1.4, palette.text_secondary),
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(name)
+                                            .size(14.0)
+                                            .strong()
+                                            .color(if is_selected {
+                                                palette.accent
+                                            } else {
+                                                palette.text_primary
+                                            }),
+                                    );
+                                    if !level.trim().is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(format!("LV{}", level.trim()))
+                                                .size(11.5)
+                                                .color(egui::Color32::from_rgb(0, 161, 214)),
+                                        );
+                                    }
+                                    if !vip.trim().is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(vip.trim())
+                                                .size(11.5)
+                                                .color(egui::Color32::from_rgb(251, 114, 153)),
+                                        );
+                                    }
+                                });
+
+                                let sub_line = if !is_active {
+                                    "状态：已关闭抢票开关".to_string()
+                                } else if !app.custom_config.enable_default_buyers {
+                                    format!("UID {} · 默认预选已关闭", uid)
+                                } else if !def_names.is_empty() {
+                                    format!("默认购票人：{}", def_names.join("、"))
+                                } else if *def_cnt > 0 {
+                                    format!("已设 {} 位默认购票人", def_cnt)
+                                } else {
+                                    format!("UID {} · 未设默认购票人", uid)
+                                };
+                                ui.label(
+                                    egui::RichText::new(sub_line)
+                                        .size(11.5)
+                                        .color(if !is_active {
+                                            palette.warn_text
+                                        } else {
+                                            palette.text_secondary
+                                        }),
+                                );
+                            });
+                        })
+                        .response;
+
+                    let interact = ui
+                        .interact(frame_resp.rect, card_id, egui::Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if interact.clicked() {
+                        app.selected_account_uid = Some(*uid);
+                    }
+                }
+            });
+        }
 
         if let Some(selected_uid) = app.selected_account_uid {
             if let Some(account) = app
@@ -444,12 +899,36 @@ fn account_selection(
                 .find(|a| a.uid == selected_uid)
             {
                 if !account.is_active {
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("⚠ 该账号已关闭抢票开关，请先在「账号管理」中开启")
-                            .size(12.5)
-                            .color(palette.warn_text),
-                    );
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(7.0, 4.0);
+                        draw_inline_status_icon(
+                            ui,
+                            false,
+                            palette.warn_text,
+                            egui::Color32::WHITE,
+                        );
+                        ui.label(
+                            egui::RichText::new("当前所选账号已关闭抢票开关")
+                                .size(12.5)
+                                .color(palette.warn_text),
+                        );
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("一键开启该账号抢票")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(palette.accent)
+                                .rounding(6.0),
+                            )
+                            .clicked()
+                        {
+                            enable_uid_now = Some(selected_uid);
+                        }
+                    });
                 } else if account.cookie_manager.is_none()
                     && app.initializing_account_uids.contains(&account.uid)
                 {
@@ -463,13 +942,13 @@ fn account_selection(
             }
         }
     });
-}
 
-fn format_account_option(name: &str, uid: i64, is_active: bool) -> String {
-    if is_active {
-        format!("{} ({})", name, uid)
-    } else {
-        format!("{} ({}) [已关闭抢票]", name, uid)
+    if let Some(uid) = enable_uid_now {
+        app.account_switch = Some(AccountSwitch {
+            uid: uid.to_string(),
+            switch: true,
+        });
+        app.show_success("已开启该账号的抢票开关");
     }
 }
 
@@ -504,7 +983,7 @@ fn grab_mode_selection(
             )
             .clicked()
             {
-                app.grab_mode = 0;
+                app.persist_grab_mode(0);
             }
 
             if mode_selection_button(
@@ -517,7 +996,7 @@ fn grab_mode_selection(
             )
             .clicked()
             {
-                app.grab_mode = 1;
+                app.persist_grab_mode(1);
             }
 
             if mode_selection_button(
@@ -530,7 +1009,7 @@ fn grab_mode_selection(
             )
             .clicked()
             {
-                app.grab_mode = 2;
+                app.persist_grab_mode(2);
             }
         });
 
@@ -560,47 +1039,82 @@ fn mode_selection_button(
     width: f32,
     palette: &HomePalette,
 ) -> egui::Response {
-    let btn = egui::Button::new(egui::RichText::new(title).size(14.0).color(if selected {
-        egui::Color32::WHITE
-    } else {
-        palette.mode_unselected_text
-    }))
-    .min_size(egui::vec2(width, 36.0))
-    .fill(if selected {
-        palette.accent
-    } else {
-        palette.mode_unselected_fill
-    })
-    .rounding(7.0)
-    .stroke(egui::Stroke::new(
-        1.0,
-        if selected {
-            palette.accent_border
-        } else {
-            palette.mode_unselected_border
-        },
-    ));
+    let size = egui::vec2(width, 36.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tooltip);
 
-    ui.add(btn).on_hover_text(tooltip)
+    if ui.is_rect_visible(rect) {
+        let hovered = resp.hovered();
+        let fill = if selected {
+            palette.accent
+        } else if hovered {
+            palette.mode_unselected_fill.linear_multiply(1.06)
+        } else {
+            palette.mode_unselected_fill
+        };
+        let border = if selected {
+            egui::Stroke::new(1.2, palette.accent_border)
+        } else if hovered {
+            egui::Stroke::new(1.1, palette.accent.linear_multiply(0.65))
+        } else {
+            egui::Stroke::new(1.0, palette.mode_unselected_border)
+        };
+        let text_color = if selected {
+            egui::Color32::WHITE
+        } else {
+            palette.mode_unselected_text
+        };
+
+        let painter = ui.painter();
+        painter.rect(rect, 7.0, fill, border);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            title,
+            egui::FontId::proportional(14.0),
+            text_color,
+        );
+    }
+
+    resp
 }
 
 fn styled_grab_button(ui: &mut egui::Ui, palette: &HomePalette) -> egui::Response {
-    let button_width = 210.0;
+    let button_width = 220.0;
     let button_height = 52.0;
 
     centered_block(ui, button_width, |ui, effective_w| {
-        let button = egui::Button::new(
-            egui::RichText::new("开始抢票")
-                .size(21.0)
-                .strong()
-                .color(egui::Color32::WHITE),
-        )
-        .min_size(egui::vec2(effective_w, button_height))
-        .fill(palette.accent)
-        .stroke(egui::Stroke::new(1.0, palette.accent_border))
-        .rounding(10.0);
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(effective_w, button_height), egui::Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
 
-        ui.add(button)
+        if ui.is_rect_visible(rect) {
+            let fill = if resp.is_pointer_button_down_on() {
+                egui::Color32::from_rgb(32, 112, 214)
+            } else if resp.hovered() {
+                egui::Color32::from_rgb(58, 148, 252)
+            } else {
+                palette.accent
+            };
+            let painter = ui.painter();
+            painter.rect(
+                rect,
+                10.0,
+                fill,
+                egui::Stroke::new(1.0, palette.accent_border),
+            );
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "开始抢票",
+                egui::FontId::proportional(20.5),
+                egui::Color32::WHITE,
+            );
+        }
+
+        resp
     })
 }
 
@@ -761,5 +1275,53 @@ mod tests {
                 .unwrap(),
             "98765"
         );
+    }
+
+    #[test]
+    fn centered_block_aligns_identically_inside_vertical_centered_on_wide_screen() {
+        let ctx = eframe::egui::Context::default();
+        let mut r1 = eframe::egui::Rect::NOTHING;
+        let mut r2 = eframe::egui::Rect::NOTHING;
+        let raw = eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(1920.0, 1080.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    r1 = super::centered_block(ui, 560.0, |ui, w| {
+                        eframe::egui::Frame::none()
+                            .inner_margin(eframe::egui::Margin::symmetric(12.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.set_width(w - 24.0);
+                                ui.label("Input Bar");
+                            })
+                            .response
+                            .rect
+                    });
+                    r2 = super::centered_block(ui, 560.0, |ui, w| {
+                        eframe::egui::Frame::none()
+                            .inner_margin(eframe::egui::Margin::symmetric(12.0, 7.0))
+                            .show(ui, |ui| {
+                                ui.set_width(w - 24.0);
+                                ui.label("Parsed ID Bar");
+                            })
+                            .response
+                            .rect
+                    });
+                });
+            });
+        });
+
+        assert!(
+            (r1.left() - r2.left()).abs() < 0.5 && (r1.right() - r2.right()).abs() < 0.5,
+            "blocks misaligned on wide screen: r1={:?}, r2={:?}",
+            r1,
+            r2
+        );
+        assert!(r1.left() > 600.0, "expected centered x > 600 on 1920px screen, got {:?}", r1);
     }
 }

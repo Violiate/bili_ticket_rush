@@ -1,6 +1,9 @@
 use eframe::egui;
 
 use crate::app::{normalize_fullwidth_ascii, Myapp};
+use crate::windows::confirm_ticket::{
+    compute_buyer_grid_layout, draw_buyer_card_item, draw_inline_status_icon, ConfirmPalette,
+};
 
 struct SettingsPalette {
     card_fill: egui::Color32,
@@ -336,13 +339,22 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
                     .rounding(7.0)
                     .inner_margin(egui::Margin::symmetric(9.0, 4.0))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("⚠ 自动保存失败")
-                                .size(12.5)
-                                .strong()
-                                .color(palette.error_text),
-                        )
-                        .on_hover_text(err_msg);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            draw_inline_status_icon(
+                                ui,
+                                false,
+                                palette.error_text,
+                                egui::Color32::WHITE,
+                            );
+                            ui.label(
+                                egui::RichText::new("自动保存失败")
+                                    .size(12.5)
+                                    .strong()
+                                    .color(palette.error_text),
+                            )
+                            .on_hover_text(err_msg);
+                        });
                     });
             } else if app.settings_dirty {
                 egui::Frame::none()
@@ -351,7 +363,7 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
                     .inner_margin(egui::Margin::symmetric(10.0, 4.0))
                     .show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new("✎ 编辑中 · 离开输入框后自动保存")
+                            egui::RichText::new("编辑中 · 离开输入框后自动保存")
                                 .size(12.5)
                                 .strong()
                                 .color(palette.dirty_text),
@@ -363,12 +375,21 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
                     .rounding(7.0)
                     .inner_margin(egui::Margin::symmetric(10.0, 4.0))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("✓ 已自动保存并生效")
-                                .size(12.5)
-                                .strong()
-                                .color(palette.saved_text),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            draw_inline_status_icon(
+                                ui,
+                                true,
+                                palette.saved_text,
+                                egui::Color32::WHITE,
+                            );
+                            ui.label(
+                                egui::RichText::new("已自动保存并生效")
+                                    .size(12.5)
+                                    .strong()
+                                    .color(palette.saved_text),
+                            );
+                        });
                     });
             } else {
                 ui.label(
@@ -395,11 +416,24 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             let input_width = (ui.available_width() - 210.0).clamp(220.0, 520.0);
 
+            // 卡片 0：默认购票人设置（高频人性化配置）
+            settings_card(
+                ui,
+                "默认购票人设置",
+                Some("为每个账号预设最多 2 位常用购票人：单人实名项目自动勾选「默认1」，一票一证/捡漏模式自动勾选全部已设默认购票人（支持随时手动改选）"),
+                &palette,
+                |ui| {
+                    render_default_buyers_settings(app, ui, &palette, &mut should_auto_save);
+                },
+            );
+
+            ui.add_space(12.0);
+
             // 卡片 1：基础设置
             settings_card(
                 ui,
                 "基础设置",
-                Some("预填手机号将在非实名制项目确认页及添加购票人时自动填充；所有设置离开输入框后自动保存并立即生效"),
+                Some("预填联系人姓名与手机号将在非实名制项目确认页及添加购票人时自动填充；所有设置离开输入框后自动保存并立即生效"),
                 &palette,
                 |ui| {
                     render_global_settings(app, ui, input_width, &palette, &mut should_auto_save);
@@ -440,6 +474,302 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
     }
 }
 
+fn render_default_buyers_settings(
+    app: &mut Myapp,
+    ui: &mut egui::Ui,
+    palette: &SettingsPalette,
+    should_auto_save: &mut bool,
+) {
+    let mut dirty = false;
+    let mut refresh_uid: Option<i64> = None;
+    let mut open_add_buyer_uid: Option<i64> = None;
+    let mut open_login = false;
+    let mut limit_hint: Option<&'static str> = None;
+
+    ui.horizontal(|ui| {
+        if on_switch(
+            ui,
+            "自动勾选默认购票人",
+            &mut app.custom_config.enable_default_buyers,
+            palette,
+        )
+        .changed()
+        {
+            dirty = true;
+            *should_auto_save = true;
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(if app.custom_config.enable_default_buyers {
+                "已开启：打开购票确认页时自动勾选，免重复点击"
+            } else {
+                "已关闭：每次打开购票确认页时保持空白手动选择"
+            })
+            .size(12.5)
+            .color(palette.text_hint),
+        );
+    });
+
+    ui.add_space(10.0);
+
+    let accounts_snapshot: Vec<(i64, String)> = app
+        .account_manager
+        .accounts
+        .iter()
+        .map(|a| (a.uid, a.name.clone()))
+        .collect();
+
+    if accounts_snapshot.is_empty() {
+        egui::Frame::none()
+            .fill(palette.unselected_fill)
+            .stroke(egui::Stroke::new(1.0, palette.unselected_border))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("当前尚未登录账号，登录后即可为每个账号独立配置最多 2 位默认购票人。")
+                            .size(13.0)
+                            .color(palette.text_secondary),
+                    );
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("去登录账号")
+                                    .size(12.5)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(palette.accent)
+                            .rounding(6.0),
+                        )
+                        .clicked()
+                    {
+                        open_login = true;
+                    }
+                });
+            });
+    } else {
+        for (idx, (uid, acc_name)) in accounts_snapshot.iter().enumerate() {
+            if idx > 0 {
+                ui.add_space(10.0);
+            }
+            let is_refreshing = app.settings_buyer_refresh_tasks.contains_key(uid);
+            let cached_buyers = app
+                .account_buyers_cache
+                .get(uid)
+                .cloned()
+                .unwrap_or_default();
+            let current_defaults = app.custom_config.default_buyers_for_uid(*uid);
+
+            egui::Frame::none()
+                .fill(if ui.visuals().dark_mode {
+                    egui::Color32::from_rgb(30, 33, 41)
+                } else {
+                    egui::Color32::from_rgb(255, 255, 255)
+                })
+                .stroke(egui::Stroke::new(1.0, palette.card_border))
+                .rounding(9.0)
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_min_width((ui.available_width() - 4.0).max(240.0));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "账号 {}：{} ({})",
+                                idx + 1,
+                                acc_name,
+                                uid
+                            ))
+                            .size(14.0)
+                            .strong()
+                            .color(palette.text_primary),
+                        );
+
+                        egui::Frame::none()
+                            .fill(if current_defaults.is_empty() {
+                                palette.unselected_fill
+                            } else {
+                                palette.saved_bg
+                            })
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::symmetric(7.0, 2.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "默认 {}/2 人",
+                                        current_defaults.len()
+                                    ))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(if current_defaults.is_empty() {
+                                        palette.text_hint
+                                    } else {
+                                        palette.saved_text
+                                    }),
+                                );
+                            });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let sync_label = if is_refreshing {
+                                "同步中..."
+                            } else {
+                                "同步购票人"
+                            };
+                            if ui
+                                .add_enabled(
+                                    !is_refreshing,
+                                    egui::Button::new(egui::RichText::new(sync_label).size(12.0))
+                                        .rounding(6.0),
+                                )
+                                .on_hover_text("从 B 站拉取该账号下最新的实名购票人列表")
+                                .clicked()
+                            {
+                                refresh_uid = Some(*uid);
+                            }
+
+                            if ui
+                                .add(
+                                    egui::Button::new(egui::RichText::new("+ 新增").size(12.0))
+                                        .rounding(6.0),
+                                )
+                                .on_hover_text("为该账号添加新的实名购票人")
+                                .clicked()
+                            {
+                                open_add_buyer_uid = Some(*uid);
+                            }
+
+                            if current_defaults.len() == 2
+                                && ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("互换主次").size(12.0),
+                                        )
+                                        .rounding(6.0),
+                                    )
+                                    .on_hover_text("互换「默认 1」与「默认 2」（单人实名项目优先勾选默认 1）")
+                                    .clicked()
+                            {
+                                app.custom_config.swap_default_buyers_for_uid(*uid);
+                                dirty = true;
+                                *should_auto_save = true;
+                            }
+
+                            if !current_defaults.is_empty()
+                                && ui
+                                    .add(
+                                        egui::Button::new(egui::RichText::new("清空").size(12.0))
+                                            .rounding(6.0),
+                                    )
+                                    .on_hover_text("清空该账号的默认购票人")
+                                    .clicked()
+                            {
+                                app.custom_config.set_default_buyers_for_uid(*uid, Vec::new());
+                                dirty = true;
+                                *should_auto_save = true;
+                            }
+                        });
+                    });
+
+                    ui.add_space(10.0);
+
+                    if cached_buyers.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            if is_refreshing {
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new("正在同步实名购票人列表...")
+                                        .size(12.5)
+                                        .color(palette.text_secondary),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "本地暂无该账号的购票人缓存，点击右上角「同步购票人」即可拉取并点选默认购票人。",
+                                    )
+                                    .size(12.5)
+                                    .color(palette.text_hint),
+                                );
+                            }
+                        });
+                    } else {
+                        let buyer_palette = ConfirmPalette::from_dark_mode(ui.visuals().dark_mode);
+                        let grid_w = (ui.available_width() - 4.0).max(240.0);
+                        let (cols, cell_inner_w) = compute_buyer_grid_layout(grid_w);
+                        let cell_outer_w = cell_inner_w + 24.0;
+
+                        for (row_idx, row_buyers) in cached_buyers.chunks(cols).enumerate() {
+                            if row_idx > 0 {
+                                ui.add_space(8.0);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                for buyer in row_buyers {
+                                    let rank = current_defaults
+                                        .iter()
+                                        .position(|&id| id == buyer.id)
+                                        .map(|p| p + 1);
+                                    let is_sel = rank.is_some();
+                                    let card_id =
+                                        ui.id().with(("settings_default_buyer", *uid, buyer.id));
+                                    let resp = draw_buyer_card_item(
+                                        ui,
+                                        card_id,
+                                        buyer,
+                                        is_sel,
+                                        rank,
+                                        true,
+                                        cell_outer_w,
+                                        &buyer_palette,
+                                    )
+                                    .on_hover_text(
+                                        "点击设为默认或取消默认（每账号最多 2 位，按点击先后区分默认 1 / 默认 2）",
+                                    );
+
+                                    if resp.clicked() {
+                                        match app
+                                            .custom_config
+                                            .toggle_default_buyer_for_uid(*uid, buyer.id)
+                                        {
+                                            Ok(_) => {
+                                                dirty = true;
+                                                *should_auto_save = true;
+                                            }
+                                            Err(msg) => {
+                                                limit_hint = Some(msg);
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+        }
+    }
+
+    if dirty {
+        app.settings_dirty = true;
+    }
+    if let Some(msg) = limit_hint {
+        app.show_info(msg);
+    }
+    if open_login {
+        app.show_login_windows = true;
+    }
+    if let Some(uid) = refresh_uid {
+        app.request_account_buyers_refresh(uid, false);
+    }
+    if let Some(uid) = open_add_buyer_uid {
+        app.add_buyer_input = crate::windows::add_buyer::AddBuyerInput::default();
+        app.add_buyer_active_task_id = None;
+        app.add_buyer_submitting = false;
+        app.add_buyer_error = None;
+        app.show_add_buyer_window = Some(uid.to_string());
+    }
+}
+
 fn render_global_settings(
     app: &mut Myapp,
     ui: &mut egui::Ui,
@@ -449,44 +779,95 @@ fn render_global_settings(
 ) {
     let mut dirty = false;
     let ime_composing = app.is_ime_composing();
+    let acc1_tag = app
+        .account_manager
+        .accounts
+        .first()
+        .map(|a| format!("账号 1 ({}) 预填：", a.name))
+        .unwrap_or_else(|| "账号 1 预填联系人：".to_string());
+    let acc2_tag = app
+        .account_manager
+        .accounts
+        .get(1)
+        .map(|a| format!("账号 2 ({}) 预填：", a.name))
+        .unwrap_or_else(|| "账号 2 预填联系人：".to_string());
+
+    let name_w = (input_width * 0.36).clamp(100.0, 170.0);
+    let phone_w = (input_width - name_w - 10.0).max(130.0);
 
     egui::Grid::new("settings_global_grid")
         .num_columns(2)
         .spacing(egui::vec2(14.0, 10.0))
         .min_col_width(145.0)
         .show(ui, |ui| {
-            grid_label(ui, "账号 1 预填手机号：", palette);
-            let out = text_input_row(
-                ui,
-                &mut app.custom_config.preinput_phone1,
-                "仅输入数字（非实名制下单/添加购票人自动填充）",
-                input_width,
-                true,
-                ime_composing,
-            );
-            if out.changed {
-                dirty = true;
-            }
-            if out.lost_focus {
-                *should_auto_save = true;
-            }
+            grid_label(ui, &acc1_tag, palette);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let out_name = text_input_row(
+                    ui,
+                    &mut app.custom_config.preinput_name1,
+                    "姓名（可选）",
+                    name_w,
+                    false,
+                    ime_composing,
+                );
+                let out_phone = text_input_row(
+                    ui,
+                    &mut app.custom_config.preinput_phone1,
+                    "手机号（仅数字，自动预填）",
+                    phone_w,
+                    true,
+                    ime_composing,
+                );
+                if out_name.changed || out_phone.changed {
+                    dirty = true;
+                }
+                if out_name.lost_focus || out_phone.lost_focus {
+                    *should_auto_save = true;
+                }
+            });
             ui.end_row();
 
-            grid_label(ui, "账号 2 预填手机号：", palette);
-            let out = text_input_row(
-                ui,
-                &mut app.custom_config.preinput_phone2,
-                "仅输入数字（可选，用于第 2 个账号自动填充）",
-                input_width,
-                true,
-                ime_composing,
-            );
-            if out.changed {
-                dirty = true;
-            }
-            if out.lost_focus {
-                *should_auto_save = true;
-            }
+            grid_label(ui, &acc2_tag, palette);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let out_name = text_input_row(
+                    ui,
+                    &mut app.custom_config.preinput_name2,
+                    "姓名（可选）",
+                    name_w,
+                    false,
+                    ime_composing,
+                );
+                let out_phone = text_input_row(
+                    ui,
+                    &mut app.custom_config.preinput_phone2,
+                    "手机号（仅数字，自动预填）",
+                    phone_w,
+                    true,
+                    ime_composing,
+                );
+                if out_name.changed || out_phone.changed {
+                    dirty = true;
+                }
+                if out_name.lost_focus || out_phone.lost_focus {
+                    *should_auto_save = true;
+                }
+            });
+            ui.end_row();
+
+            grid_label(ui, "抢票成功声音提醒：", palette);
+            ui.horizontal(|ui| {
+                if on_switch(ui, "", &mut app.custom_config.alert_on_success, palette).changed() {
+                    dirty = true;
+                    *should_auto_save = true;
+                }
+                ui.label(
+                    egui::RichText::new("挂机锁单成功弹出付款码时播放系统提示音")
+                        .size(12.0)
+                        .color(palette.text_hint),
+                );
+            });
             ui.end_row();
 
             grid_label(ui, "验证码识别方式：", palette);

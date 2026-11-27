@@ -9,6 +9,9 @@ eframe = { version = "0.23.0", features = ["default"] }
 # 字体依赖
 egui_extras = { version = "0.23.0", features = ["all_loaders"] }
 
+# 剪贴板读取（复用工作区已锁定的 arboard 版本）
+arboard = "3.4"
+
 # 背景图片
 image = "0.25"
 

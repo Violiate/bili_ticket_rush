@@ -172,6 +172,7 @@ pub struct Myapp {
     pub add_buyer_active_task_id: Option<String>,
     pub add_buyer_submitting: bool,
     pub add_buyer_error: Option<String>,
+    pub pending_auto_default_buyer: Option<(i64, String)>,
 
     // 订单列表窗口
     pub show_orderlist_window: Option<String>,
@@ -208,6 +209,10 @@ pub struct Myapp {
     pub confirm_ticket_info: Option<String>,
     pub selected_buyer_uid: Option<i64>,
     pub selected_buyer_list: Option<Vec<BuyerInfo>>,
+    pub default_buyers_applied_uid: Option<i64>,
+    pub account_buyers_cache: HashMap<i64, Vec<BuyerInfo>>,
+    pub settings_buyer_refresh_tasks: HashMap<i64, String>,
+    pub last_project_selection: HashMap<String, (usize, usize)>,
 
     pub local_captcha: LocalCaptcha,
 
@@ -380,6 +385,21 @@ impl Myapp {
 
         let machine_id = common::machine_id::get_machine_id_ob();
 
+        let mut account_buyers_cache = HashMap::new();
+        for acc in &accounts {
+            if let Ok(cached_buyers) = common::utils::load_buyer_cache(acc.uid) {
+                if !cached_buyers.is_empty() {
+                    account_buyers_cache.insert(acc.uid, cached_buyers);
+                }
+            }
+        }
+        let initial_grab_mode = custom_config.default_grab_mode.min(2);
+        let initial_skip_words = if custom_config.saved_skip_words.is_empty() {
+            None
+        } else {
+            Some(custom_config.saved_skip_words.clone())
+        };
+
         let mut app = Self {
             app: String::from("BRT"),
             version: String::from(crate::version::POLICY_CLIENT_VERSION),
@@ -446,17 +466,12 @@ impl Myapp {
             delete_account: None,
             cookie_login: None,
             account_switch: None,
-            add_buyer_input: AddBuyerInput {
-                name: String::new(),
-                phone: String::new(),
-                id_type: 0,
-                id_number: String::new(),
-                as_default_buyer: false,
-            },
+            add_buyer_input: AddBuyerInput::default(),
             show_add_buyer_window: None,
             add_buyer_active_task_id: None,
             add_buyer_submitting: false,
             add_buyer_error: None,
+            pending_auto_default_buyer: None,
             show_orderlist_window: None,
             total_order_data: None,
             orderlist_page: 0,
@@ -467,7 +482,7 @@ impl Myapp {
             orderlist_error: None,
             orderlist_detail_id: None,
             status_delay: 2,
-            grab_mode: 0,
+            grab_mode: initial_grab_mode,
             selected_account_uid: None,
             bilibiliticket_list: Vec::new(),
             show_screen_info: None,
@@ -486,6 +501,10 @@ impl Myapp {
             confirm_ticket_info: None,
             selected_buyer_uid: None,
             selected_buyer_list: None,
+            default_buyers_applied_uid: None,
+            account_buyers_cache,
+            settings_buyer_refresh_tasks: HashMap::new(),
+            last_project_selection: HashMap::new(),
             local_captcha: LocalCaptcha::new(),
             pending_pay_qrs: VecDeque::new(),
             pay_qr_texture_cache: None,
@@ -494,7 +513,7 @@ impl Myapp {
             announce3: None,
             announce4: None,
             machine_id,
-            skip_words: None,
+            skip_words: initial_skip_words,
             skip_words_input: String::new(),
             ime_composing: false,
             ime_active_this_frame: false,
@@ -591,6 +610,8 @@ impl Myapp {
 
     /// 持久化当前设置（并在写入前规范化数字类字段中的全角数字），实时同步 UA 与推送配置。
     pub fn auto_save_settings(&mut self) -> bool {
+        self.custom_config.preinput_name1 = self.custom_config.preinput_name1.trim().to_string();
+        self.custom_config.preinput_name2 = self.custom_config.preinput_name2.trim().to_string();
         self.custom_config.preinput_phone1 =
             normalize_fullwidth_ascii(&self.custom_config.preinput_phone1)
                 .chars()
@@ -679,6 +700,87 @@ impl Myapp {
     pub fn reset_buyer_selection(&mut self) {
         self.selected_buyer_list = None;
         self.selected_buyer_uid = None;
+        self.default_buyers_applied_uid = None;
+    }
+
+    pub fn persist_skip_words(&mut self) {
+        let next = self.skip_words.clone().unwrap_or_default();
+        if self.custom_config.saved_skip_words != next {
+            self.custom_config.saved_skip_words = next;
+            let _ = save_config(&mut self.config, None, Some(&self.custom_config), None);
+        }
+    }
+
+    pub fn persist_grab_mode(&mut self, mode: u8) {
+        let clamped = mode.min(2);
+        self.grab_mode = clamped;
+        if self.custom_config.default_grab_mode != clamped {
+            self.custom_config.default_grab_mode = clamped;
+            let _ = save_config(&mut self.config, None, Some(&self.custom_config), None);
+        }
+    }
+
+    pub fn record_recent_project_and_save(&mut self, project_id: &str, name: &str) {
+        let before = self.custom_config.recent_projects.clone();
+        self.custom_config.record_recent_project(project_id, name);
+        if self.custom_config.recent_projects != before {
+            let _ = save_config(&mut self.config, None, Some(&self.custom_config), None);
+        }
+    }
+
+    /// 在后台刷新指定账号的实名购票人缓存（供设置页默认购票人配置及新登录/新增购票人后同步使用）
+    pub fn request_account_buyers_refresh(&mut self, uid: i64, silent: bool) {
+        if self.settings_buyer_refresh_tasks.contains_key(&uid) {
+            return;
+        }
+        let Some(account) = self
+            .account_manager
+            .accounts
+            .iter()
+            .find(|a| a.uid == uid)
+            .cloned()
+        else {
+            if !silent {
+                self.show_error(format!("未找到账号 {}", uid));
+            }
+            return;
+        };
+        let Some(cm) = account.cookie_manager.clone() else {
+            if !silent {
+                if self.initializing_account_uids.contains(&uid) {
+                    self.show_info("账号客户端正在后台初始化，请稍后再点击同步");
+                } else {
+                    self.show_error("账号客户端未初始化，请重新登录");
+                }
+            }
+            return;
+        };
+
+        let req = TaskRequest::GetBuyerInfoRequest(GetBuyerInfoRequest {
+            task_id: String::new(),
+            uid,
+            cookie_manager: cm,
+        });
+        match self.task_manager.submit_task(req) {
+            Ok(task_id) => {
+                self.settings_buyer_refresh_tasks.insert(uid, task_id);
+            }
+            Err(e) => {
+                if !silent {
+                    self.show_error(format!("提交购票人同步请求失败: {}", e));
+                }
+            }
+        }
+    }
+
+    pub fn trigger_success_attention(&self) {
+        if !self.custom_config.alert_on_success {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            winapi::um::winuser::MessageBeep(winapi::um::winuser::MB_ICONASTERISK);
+        }
     }
 
     pub fn reset_login_state(&mut self) {
@@ -699,6 +801,25 @@ impl Myapp {
         self.login_input.sms_code.clear();
         // 重建登录专用 HTTP 客户端，确保每次新登录会话拥有独立的空 cookie store
         self.client = create_client(self.effective_ua());
+    }
+
+    pub fn get_preinput_name_for_uid(&self, uid: i64) -> Option<String> {
+        let idx = self
+            .account_manager
+            .accounts
+            .iter()
+            .position(|a| a.uid == uid)?;
+        let raw = match idx {
+            0 => &self.custom_config.preinput_name1,
+            1 => &self.custom_config.preinput_name2,
+            _ => return None,
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     pub fn get_preinput_phone_for_uid(&self, uid: i64) -> Option<String> {
@@ -896,6 +1017,12 @@ impl Myapp {
                 self.show_error(format!("账号已登录，但保存配置失败: {}", e));
             }
         }
+        if let Ok(cached) = common::utils::load_buyer_cache(uid) {
+            if !cached.is_empty() {
+                self.account_buyers_cache.insert(uid, cached);
+            }
+        }
+        self.request_account_buyers_refresh(uid, true);
     }
 
     pub fn remove_account_locally(&mut self, uid: i64) {
@@ -958,6 +1085,16 @@ impl Myapp {
         self.image_cache.remove(&avatar_key);
         self.image_cache_order.retain(|k| k != &avatar_key);
 
+        self.account_buyers_cache.remove(&uid);
+        self.settings_buyer_refresh_tasks.remove(&uid);
+        if self
+            .custom_config
+            .default_buyers_by_uid
+            .remove(&uid.to_string())
+            .is_some()
+        {
+            let _ = save_config(&mut self.config, None, Some(&self.custom_config), None);
+        }
         let _ = self.config.delete_account(uid);
         log::info!("账号 {} 已移除", uid);
         self.show_success(format!("账号 {} 已移除", uid));
@@ -1273,6 +1410,7 @@ impl Myapp {
                         == Some(buyer_res.task_id.as_str());
                     if buyer_res.success {
                         self.invalidate_buyer_cache(buyer_res.uid);
+                        self.request_account_buyers_refresh(buyer_res.uid, true);
                         log::info!("购票人添加成功: {}", buyer_res.message);
                         self.show_success("购票人添加成功，列表将自动刷新");
                         if is_active {
@@ -1348,15 +1486,53 @@ impl Myapp {
                             continue;
                         };
                         let project_info = inforesponse.data;
+                        let rec_id = project_info
+                            .id
+                            .map(|id| id.to_string())
+                            .unwrap_or_default();
+                        let rec_name = project_info.name.clone().unwrap_or_default();
                         if let Some(bilibili_ticket) = self
                             .bilibiliticket_list
                             .iter_mut()
                             .find(|ticket| ticket.uid == ticket_result.uid)
                         {
+                            let pid_to_record = if !bilibili_ticket.project_id.trim().is_empty() {
+                                bilibili_ticket.project_id.clone()
+                            } else {
+                                rec_id
+                            };
                             bilibili_ticket.project_info = Some(project_info);
                             self.project_info_error = None;
-                            // 每次成功加载新项目详情时重置场次索引，防止切项目越界空白
-                            self.selected_screen_index = Some(0);
+                            // 每次成功加载项目详情时，若存在上次该项目的场次记录则优先定位，否则智能定位首个可售场次
+                            if let Some(ref proj) = bilibili_ticket.project_info {
+                                let preferred_screen = self
+                                    .last_project_selection
+                                    .get(&pid_to_record)
+                                    .and_then(|&(sid, _)| {
+                                        proj.screen_list.iter().position(|s| s.id == Some(sid))
+                                    })
+                                    .or_else(|| {
+                                        proj.screen_list.iter().position(|s| {
+                                            s.ticket_list.iter().any(|t| {
+                                                t.clickable.unwrap_or(false)
+                                                    || matches!(
+                                                        t.sale_flag_number
+                                                            .unwrap_or(t.sale_flag.number),
+                                                        1 | 8
+                                                    )
+                                            })
+                                        })
+                                    })
+                                    .unwrap_or(0);
+                                self.selected_screen_index = if proj.screen_list.is_empty() {
+                                    None
+                                } else {
+                                    Some(preferred_screen)
+                                };
+                            } else {
+                                self.selected_screen_index = Some(0);
+                            }
+                            self.record_recent_project_and_save(&pid_to_record, &rec_name);
                             log::info!("获取项目详情成功");
                         } else {
                             log::warn!(
@@ -1371,9 +1547,72 @@ impl Myapp {
                     }
                 }
                 TaskResult::GetBuyerInfoResult(buyer_result) => {
-                    if self.buyer_info_active_task_id.as_deref()
-                        != Some(buyer_result.task_id.as_str())
-                    {
+                    let is_settings_refresh = self
+                        .settings_buyer_refresh_tasks
+                        .get(&buyer_result.uid)
+                        .map(String::as_str)
+                        == Some(buyer_result.task_id.as_str());
+                    let is_confirm_active = self.buyer_info_active_task_id.as_deref()
+                        == Some(buyer_result.task_id.as_str());
+
+                    if is_settings_refresh {
+                        self.settings_buyer_refresh_tasks.remove(&buyer_result.uid);
+                        if buyer_result.success {
+                            if let Some(ref response) = buyer_result.buyer_info {
+                                if response.errno == 0 {
+                                    self.account_buyers_cache
+                                        .insert(buyer_result.uid, response.data.list.clone());
+                                    if let Some((pend_uid, ref pend_name)) =
+                                        self.pending_auto_default_buyer.clone()
+                                    {
+                                        if pend_uid == buyer_result.uid {
+                                            self.pending_auto_default_buyer = None;
+                                            if let Some(matched) = response
+                                                .data
+                                                .list
+                                                .iter()
+                                                .rev()
+                                                .find(|b| b.name.trim() == pend_name)
+                                            {
+                                                if self
+                                                    .custom_config
+                                                    .default_buyers_for_uid(pend_uid)
+                                                    .len()
+                                                    < common::utility::MAX_DEFAULT_BUYERS_PER_ACCOUNT
+                                                {
+                                                    let _ = self
+                                                        .custom_config
+                                                        .toggle_default_buyer_for_uid(
+                                                            pend_uid,
+                                                            matched.id,
+                                                        );
+                                                    let _ = self.auto_save_settings();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if let Some(bt) = self
+                                        .bilibiliticket_list
+                                        .iter_mut()
+                                        .find(|t| t.uid == buyer_result.uid)
+                                    {
+                                        bt.all_buyer_info = Some(response.data.clone());
+                                    }
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "后台同步账号 {} 购票人失败: {}",
+                                buyer_result.uid,
+                                buyer_result.message
+                            );
+                        }
+                        if !is_confirm_active {
+                            continue;
+                        }
+                    }
+
+                    if !is_confirm_active {
                         continue;
                     }
                     self.buyer_info_requesting = false;
@@ -1394,6 +1633,8 @@ impl Myapp {
                             log::error!("{}", msg);
                             continue;
                         }
+                        self.account_buyers_cache
+                            .insert(buyer_result.uid, response.data.list.clone());
                         if let Some(bilibili_ticket) = self
                             .bilibiliticket_list
                             .iter_mut()
@@ -1441,6 +1682,7 @@ impl Myapp {
                         let yuan = pay_money_fen as f64 / 100.0;
                         let title = format!("恭喜！{} 抢票成功（¥{:.2}）", confirm.project_name, yuan);
                         log::info!("已弹出支付二维码，订单号: {}（请在有效期内尽快完成支付）", order_id);
+                        self.trigger_success_attention();
                         self.show_success(title);
                         // 注意：推送通知已由 backend/src/taskmanager.rs 使用实时 PushConfig 单次发出，此处不再重复提交 PushRequest
                     } else {
@@ -1873,6 +2115,7 @@ impl eframe::App for Myapp {
             || self.orderlist_requesting
             || self.project_info_requesting
             || self.buyer_info_requesting
+            || !self.settings_buyer_refresh_tasks.is_empty()
             || self.login_qr_requesting
             || self.qrcode_polling_task_id.is_some()
             || self.login_submitting
@@ -2021,6 +2264,63 @@ fn generate_random_string(length: usize) -> String {
         .collect()
 }
 
+/// 读取系统剪贴板文本（自动去除控制字符与首尾空白）
+pub fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let raw = clipboard.get_text().ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// 根据账号配置的默认购票人与项目选择模式，计算首次打开选人页时应自动勾选的购票人列表：
+/// - `enable_default_buyers == false` -> 不自动勾选（返回空）
+/// - 优先按 `configured_default_ids` 顺序匹配当前有效购票人（单选只取第 1 位，多选最多取 2 位）
+/// - 若该账号尚未配置自定义默认购票人，则回退匹配 B 站标记 `is_default == 1` 的购票人（或唯一购票人）
+pub fn resolve_initial_buyers(
+    enable_default_buyers: bool,
+    configured_default_ids: &[i64],
+    available_buyers: &[BuyerInfo],
+    is_multi_select: bool,
+) -> Vec<BuyerInfo> {
+    if !enable_default_buyers || available_buyers.is_empty() {
+        return Vec::new();
+    }
+
+    let max_pick = if is_multi_select {
+        common::utility::MAX_DEFAULT_BUYERS_PER_ACCOUNT
+    } else {
+        1
+    };
+
+    let mut picked = Vec::with_capacity(max_pick);
+    for &target_id in configured_default_ids {
+        if let Some(found) = available_buyers.iter().find(|b| b.id == target_id) {
+            if !picked.iter().any(|b: &BuyerInfo| b.id == found.id) {
+                picked.push(found.clone());
+                if picked.len() >= max_pick {
+                    return picked;
+                }
+            }
+        }
+    }
+
+    if !picked.is_empty() {
+        return picked;
+    }
+
+    // 未配置自定义默认时：优先使用 B 站默认购票人，若账号下仅有 1 位实名购票人则直接预选该人
+    if let Some(bili_default) = available_buyers.iter().find(|b| b.is_default == 1) {
+        picked.push(bili_default.clone());
+    } else if available_buyers.len() == 1 {
+        picked.push(available_buyers[0].clone());
+    }
+    picked
+}
+
 /// 将中文输入法可能输出的全角 ASCII 字符（０-９、Ａ-Ｚ、ａ-ｚ、标点）和全角空格转换为标准半角 ASCII，
 /// 保留中文汉字与其他 Unicode 字符不变。
 pub fn normalize_fullwidth_ascii(input: &str) -> String {
@@ -2131,8 +2431,59 @@ pub(crate) fn normalize_ime_events(
 mod tests {
     use super::{
         decode_image_to_color_image, normalize_fullwidth_ascii, normalize_ime_events,
+        resolve_initial_buyers,
     };
+    use common::ticket::BuyerInfo;
     use eframe::egui;
+
+    fn sample_buyer(id: i64, name: &str, is_default: i64) -> BuyerInfo {
+        BuyerInfo {
+            id,
+            name: name.to_string(),
+            is_default,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_initial_buyers_respects_switch_order_mode_and_fallback() {
+        let buyers = vec![
+            sample_buyer(10, "甲", 1),
+            sample_buyer(20, "乙", 0),
+            sample_buyer(30, "丙", 0),
+        ];
+
+        // 1. 开关关闭时绝不自动勾选
+        assert!(resolve_initial_buyers(false, &[20, 30], &buyers, true).is_empty());
+
+        // 2. 单人实名模式仅取配置的第 1 位主选购票人（无视 B 站 is_default）
+        let single = resolve_initial_buyers(true, &[30, 20], &buyers, false);
+        assert_eq!(single.iter().map(|b| b.id).collect::<Vec<_>>(), vec![30]);
+
+        // 3. 多选模式（一票一证 / 捡漏）按主次顺序同时勾选最多 2 位
+        let multi = resolve_initial_buyers(true, &[30, 20], &buyers, true);
+        assert_eq!(
+            multi.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![30, 20]
+        );
+
+        // 4. 若已配置的第1位已被用户在B站删除，自动跳过并优雅选用第2位有效购票人
+        let partial = resolve_initial_buyers(true, &[999, 20], &buyers, false);
+        assert_eq!(partial.iter().map(|b| b.id).collect::<Vec<_>>(), vec![20]);
+
+        // 5. 未配置自定义默认购票人时回退至 B 站默认购票人
+        let fallback_bili = resolve_initial_buyers(true, &[], &buyers, true);
+        assert_eq!(
+            fallback_bili.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        // 6. 无 B 站默认但账号仅有唯一实名购票人时自动勾选该人
+        let only_one = vec![sample_buyer(77, "唯一", 0)];
+        let fallback_single = resolve_initial_buyers(true, &[], &only_one, false);
+        assert_eq!(fallback_single.len(), 1);
+        assert_eq!(fallback_single[0].id, 77);
+    }
 
     #[test]
     fn circular_mask_makes_corners_transparent_and_center_opaque() {

@@ -180,6 +180,7 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
 
     let mut tasks_to_cancel: Vec<String> = Vec::new();
     let mut clear_recent = false;
+    let mut reconfigure_action: Option<(i64, String, u8)> = None;
 
     egui::ScrollArea::vertical()
         .id_source("monitor_tab_scroll")
@@ -454,27 +455,58 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width().max(240.0));
 
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-                                badge(ui, status_label, status_color);
-                                badge(
-                                    ui,
-                                    grab_mode_label(task.grab_mode),
-                                    mode_color(task.grab_mode),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "耗时 {}",
-                                        format_elapsed(duration_secs)
-                                    ))
-                                    .size(12.5)
-                                    .color(palette.text_secondary),
-                                );
-                                if !task.project_id.trim().is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+                                    badge(ui, status_label, status_color);
+                                    badge(
+                                        ui,
+                                        grab_mode_label(task.grab_mode),
+                                        mode_color(task.grab_mode),
+                                    );
                                     ui.label(
-                                        egui::RichText::new(format!("ID: {}", task.project_id))
-                                            .size(12.0)
-                                            .color(palette.text_muted),
+                                        egui::RichText::new(format!(
+                                            "耗时 {}",
+                                            format_elapsed(duration_secs)
+                                        ))
+                                        .size(12.5)
+                                        .color(palette.text_secondary),
+                                    );
+                                    if !task.project_id.trim().is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(format!("ID: {}", task.project_id))
+                                                .size(12.0)
+                                                .color(palette.text_muted),
+                                        );
+                                    }
+                                });
+
+                                if !task.project_id.trim().is_empty() {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new("重新配置")
+                                                            .size(12.0)
+                                                            .color(palette.text_primary),
+                                                    )
+                                                    .rounding(6.0)
+                                                    .min_size(egui::vec2(68.0, 24.0)),
+                                                )
+                                                .on_hover_text(
+                                                    "使用该记录的项目ID、账号与模式直接重新打开选票/确认窗口",
+                                                )
+                                                .clicked()
+                                            {
+                                                reconfigure_action = Some((
+                                                    task.uid,
+                                                    task.project_id.clone(),
+                                                    task.grab_mode,
+                                                ));
+                                            }
+                                        },
                                     );
                                 }
                             });
@@ -540,6 +572,16 @@ pub fn render(app: &mut Myapp, ui: &mut egui::Ui) {
     if clear_recent {
         app.task_manager.clear_recent_tasks();
         app.show_info("已清空近期任务记录");
+    }
+
+    if let Some((uid, project_id, mode)) = reconfigure_action {
+        app.ticket_id = project_id;
+        app.persist_grab_mode(mode);
+        if app.account_manager.accounts.iter().any(|a| a.uid == uid) {
+            app.selected_account_uid = Some(uid);
+        }
+        app.selected_tab = 0;
+        crate::ui::tabs::home::trigger_start_grab(app);
     }
 }
 

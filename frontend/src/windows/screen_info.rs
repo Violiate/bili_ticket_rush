@@ -162,6 +162,10 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
     let account_name = app.bilibiliticket_list[ticket_idx].account.name.as_str();
     let ticket_method = app.bilibiliticket_list[ticket_idx].method;
     let draft_project_id = app.bilibiliticket_list[ticket_idx].project_id.as_str();
+    let last_picked_ticket_id = app
+        .last_project_selection
+        .get(draft_project_id)
+        .map(|&(_, tid)| tid);
     let selected_screen_index = &mut app.selected_screen_index;
     let allow_force_select = &mut app.allow_force_select_unavailable;
     let project_info_error_ref = app.project_info_error.as_deref();
@@ -190,6 +194,11 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
         .resizable(true)
         .collapsible(false)
         .show(ctx, |ui| {
+            if ui.ctx().memory(|m| m.focus().is_none())
+                && ui.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                close_clicked = true;
+            }
             let render_header = |ui: &mut egui::Ui, retry_clicked: &mut bool| {
                 // 顶部账号 / 项目ID / 模式信息栏 + 刷新按钮
                 ui.horizontal(|ui| {
@@ -407,6 +416,7 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
                             if let Some(picked) = render_ticket_list_card(
                                 ui,
                                 selected_screen,
+                                last_picked_ticket_id,
                                 allow_force_select,
                                 card_inner_w,
                                 &palette,
@@ -460,6 +470,11 @@ pub fn show(app: &mut Myapp, ctx: &egui::Context, uid: i64) {
             bilibili_ticket.project_id
         );
         log::info!("已选择: {} [{}]", chosen.ticket_desc, chosen.ticket_id);
+        let saved_pid = bilibili_ticket.project_id.clone();
+        if !saved_pid.trim().is_empty() {
+            app.last_project_selection
+                .insert(saved_pid, (chosen.screen_id, chosen.ticket_id));
+        }
 
         app.selected_screen_id = Some(chosen.screen_id as i64);
         app.selected_ticket_id = Some(chosen.ticket_id as i64);
@@ -703,6 +718,7 @@ fn render_screen_selector_card(
 fn render_ticket_list_card(
     ui: &mut egui::Ui,
     selected_screen: &ScreenInfo,
+    last_picked_ticket_id: Option<usize>,
     allow_force_select: &mut bool,
     card_inner_w: f32,
     palette: &ScreenPalette,
@@ -796,6 +812,7 @@ fn render_ticket_list_card(
                     ui,
                     selected_screen.id.unwrap_or(0),
                     ticket,
+                    last_picked_ticket_id == ticket.id,
                     *allow_force_select,
                     row_inner_w,
                     palette,
@@ -818,6 +835,7 @@ fn render_ticket_row_card(
     ui: &mut egui::Ui,
     screen_id: usize,
     ticket: &ScreenTicketInfo,
+    is_last_picked: bool,
     allow_force_select: bool,
     row_inner_w: f32,
     palette: &ScreenPalette,
@@ -870,10 +888,20 @@ fn render_ticket_row_card(
         .or_else(|| ticket.saleStart.filter(|&ts| ts > 0).map(format_timestamp));
 
     let mut chosen: Option<ChosenTicket> = None;
+    let row_fill = if is_last_picked {
+        palette.selected_bg
+    } else {
+        palette.row_bg
+    };
+    let row_stroke = if is_last_picked {
+        Stroke::new(1.2, palette.selected_border)
+    } else {
+        Stroke::new(1.0, palette.row_border)
+    };
 
     let frame_resp = egui::Frame::none()
-        .fill(palette.row_bg)
-        .stroke(Stroke::new(1.0, palette.row_border))
+        .fill(row_fill)
+        .stroke(row_stroke)
         .rounding(8.0)
         .inner_margin(egui::Margin::symmetric(12.0, 9.0))
         .show(ui, |ui| {
@@ -901,6 +929,9 @@ fn render_ticket_row_card(
                                 .wrap(true),
                             );
                             pill_badge(ui, &status_text, status_bg, status_fg);
+                            if is_last_picked {
+                                pill_badge(ui, "上次选择", palette.blue_bg, palette.blue);
+                            }
                         });
 
                         let mut sub_parts: Vec<String> = Vec::new();
@@ -972,13 +1003,29 @@ fn render_ticket_row_card(
         })
         .response;
 
-    if frame_resp.hovered() && button_enabled {
-        // 轻微悬停高亮边框提示可交互行
-        ui.painter().rect_stroke(
-            frame_resp.rect,
-            8.0,
-            Stroke::new(1.0, palette.accent.linear_multiply(0.55)),
-        );
+    if button_enabled {
+        let row_click_id = ui
+            .id()
+            .with(("ticket_row_card", screen_id, ticket.id.unwrap_or(0)));
+        let row_interact = ui
+            .interact(frame_resp.rect, row_click_id, egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if row_interact.hovered() || frame_resp.hovered() {
+            ui.painter().rect_stroke(
+                frame_resp.rect,
+                8.0,
+                Stroke::new(1.2, palette.accent.linear_multiply(0.75)),
+            );
+        }
+        if chosen.is_none() && row_interact.clicked() {
+            chosen = Some(ChosenTicket {
+                screen_id,
+                ticket_id: ticket.id.unwrap_or(0),
+                project_id: ticket.project_id,
+                ticket_desc: desc.to_string(),
+                clickable,
+            });
+        }
     }
 
     chosen
@@ -1339,6 +1386,7 @@ mod tests {
                                     let _ = render_ticket_list_card(
                                         ui,
                                         screen,
+                                        screen.ticket_list.first().and_then(|t| t.id),
                                         &mut allow_force_select,
                                         card_inner_w,
                                         &palette,

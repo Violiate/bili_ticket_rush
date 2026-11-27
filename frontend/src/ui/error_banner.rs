@@ -1,4 +1,7 @@
 use crate::app::{BannerKind, Myapp};
+use crate::windows::confirm_ticket::{
+    draw_vector_checkmark, draw_vector_exclamation, draw_vector_info,
+};
 use eframe::egui;
 
 pub fn render_notification_banner(app: &Myapp, ctx: &egui::Context) {
@@ -17,23 +20,22 @@ pub fn render_notification_banner(app: &Myapp, ctx: &egui::Context) {
     let pos_x = screen_rect.center().x - banner_width / 2.0;
     let pos_y = screen_rect.top() + 12.0;
 
-    let (fill_color, stroke_color, prefix) = match banner.kind {
+    let (fill_color, stroke_color) = match banner.kind {
         BannerKind::Success => (
-            egui::Color32::from_rgba_unmultiplied(46, 160, 67, alpha),
-            egui::Color32::from_rgba_unmultiplied(35, 134, 54, alpha),
-            "✓ ",
+            egui::Color32::from_rgba_unmultiplied(22, 163, 74, alpha),
+            egui::Color32::from_rgba_unmultiplied(21, 128, 61, alpha),
         ),
         BannerKind::Error => (
-            egui::Color32::from_rgba_unmultiplied(220, 68, 55, alpha),
+            egui::Color32::from_rgba_unmultiplied(220, 56, 52, alpha),
             egui::Color32::from_rgba_unmultiplied(185, 45, 35, alpha),
-            "⚠ ",
         ),
         BannerKind::Info => (
-            egui::Color32::from_rgba_unmultiplied(59, 130, 246, alpha),
+            egui::Color32::from_rgba_unmultiplied(45, 136, 245, alpha),
             egui::Color32::from_rgba_unmultiplied(37, 99, 235, alpha),
-            "ℹ ",
         ),
     };
+    let fg_white = egui::Color32::from_rgba_unmultiplied(255, 255, 255, text_alpha);
+    let badge_bg = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha as u16 * 48 / 255) as u8);
 
     // 限制横幅显示长度，避免超长文本遮挡整个窗口
     let display_text = truncate_banner_text(&banner.text, 160);
@@ -46,20 +48,34 @@ pub fn render_notification_banner(app: &Myapp, ctx: &egui::Context) {
             let frame = egui::Frame::none()
                 .fill(fill_color)
                 .stroke(egui::Stroke::new(1.0, stroke_color))
-                .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::symmetric(14.0, 8.0));
+                .rounding(egui::Rounding::same(9.0))
+                .inner_margin(egui::Margin::symmetric(14.0, 9.0));
 
             frame.show(ui, |ui| {
                 ui.set_min_width(banner_width);
                 ui.set_max_width(banner_width);
-                ui.vertical_centered(|ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    let painter = ui.painter();
+                    painter.circle_filled(icon_rect.center(), 9.0, badge_bg);
+                    match banner.kind {
+                        BannerKind::Success => {
+                            draw_vector_checkmark(painter, icon_rect.center(), 7.5, 2.0, fg_white);
+                        }
+                        BannerKind::Error => {
+                            draw_vector_exclamation(painter, icon_rect.center(), 7.5, fg_white);
+                        }
+                        BannerKind::Info => {
+                            draw_vector_info(painter, icon_rect.center(), 7.5, fg_white);
+                        }
+                    }
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!("{}{}", prefix, display_text))
-                                .color(egui::Color32::from_rgba_unmultiplied(
-                                    255, 255, 255, text_alpha,
-                                ))
-                                .size(14.5)
+                            egui::RichText::new(display_text)
+                                .color(fg_white)
+                                .size(14.0)
                                 .strong(),
                         )
                         .wrap(true),

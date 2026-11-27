@@ -119,7 +119,7 @@ pub fn show_resizable_frame_with<S>(
         center(&mut center_ui, state);
     }
 
-    // 4. 底栏区（自然 top_down，测量真实像素高度；若有变化立即缓存并触发重绘）
+    // 4. 底栏区（自然 top_down，先铺设窗口实色背景兜底，再测量真实像素高度）
     let mut footer_ui = root_ui.child_ui_with_id_source(
         footer_rect,
         egui::Layout::top_down(egui::Align::Min),
@@ -130,6 +130,11 @@ pub fn show_resizable_frame_with<S>(
             .expand2(egui::vec2(clip_margin, 2.0))
             .intersect(root_ui.clip_rect()),
     );
+    if footer_rect.is_positive() {
+        footer_ui
+            .painter()
+            .rect_filled(footer_rect, 0.0, footer_ui.visuals().window_fill());
+    }
     footer(&mut footer_ui, state);
 
     let actual_footer_h = footer_ui.min_rect().height().max(0.0);
@@ -168,11 +173,17 @@ pub fn show_resizable_body_with<S>(
     body: impl FnOnce(&mut egui::Ui, &mut S),
 ) {
     show_resizable_frame_with(ui, state, header, footer, |ui, state| {
+        let strict_center_clip = ui.clip_rect();
         egui::ScrollArea::vertical()
             .id_source(scroll_id)
             .auto_shrink([false, false])
             .min_scrolled_height(0.0)
-            .show(ui, |ui| body(ui, state));
+            .show(ui, |ui| {
+                // 消除 egui 0.23 ScrollArea 默认向底栏方向外扩 3px clip_rect_margin 的越界绘制
+                let clamped = ui.clip_rect().intersect(strict_center_clip);
+                ui.set_clip_rect(clamped);
+                body(ui, state);
+            });
     });
 }
 
